@@ -7,6 +7,9 @@
 // The implementation of this module has been inspired by the excellent
 // article at https://habr.com/en/articles/600123/
 //
+// TODO: With epoll and kqueue, make sure that file descriptors are properly
+// closed on fork() or exec().
+//
 //----------------------------------------------------------------------------
 
 #include "tsReactor.h"
@@ -31,7 +34,13 @@
     #error "unsupported operating system"
 #endif
 
-#if defined(TS_USE_KQUEUE)
+#if defined(TS_USE_EPOLL)
+    #include "tsBeforeStandardHeaders.h"
+    #include <sys/epoll.h>
+    #include <sys/eventfd.h>
+    #include <sys/timerfd.h>
+    #include "tsAfterStandardHeaders.h"
+#elif defined(TS_USE_KQUEUE)
     #include "tsBeforeStandardHeaders.h"
     #include <sys/types.h>
     #include <sys/event.h>
@@ -108,7 +117,11 @@ private:
     bool sysDeleteTimer(EventId id, Resource& res, bool display_errors = true);
     bool sysDeleteEvent(EventId id, Resource& res, bool display_errors = true);
 
-#if defined(TS_USE_KQUEUE)
+#if defined(TS_USE_EPOLL)
+
+    int _epoll = -1;  // File descriptor for epoll().
+
+#elif defined(TS_USE_KQUEUE)
 
     using kevent_t = struct kevent;
     using kevent_ident_t = decltype(kevent_t::ident);
@@ -250,7 +263,12 @@ bool ts::Reactor::Guts::open()
 
 #if defined(TS_USE_EPOLL)
 
-    //@@@
+    // Initialize the epoll event queue.
+    assert(_epoll < 0);
+    if ((_epoll = ::epoll_create1(EPOLL_CLOEXEC)) < 0) {
+        _report.error(u"error creating epoll queue: %s", SysErrorCodeMessage());
+        success = false;
+    }
 
 #elif defined(TS_USE_KQUEUE)
 
@@ -292,7 +310,10 @@ bool ts::Reactor::Guts::close()
 
 #if defined(TS_USE_EPOLL)
 
-        //@@@
+        // Cleanup epoll queue.
+        assert(_epoll >= 0);
+        ::close(_epoll);
+        _epoll = -1;
 
 #elif defined(TS_USE_KQUEUE)
 
@@ -367,11 +388,79 @@ bool ts::Reactor::Guts::processEventLoop()
 
 #if defined(TS_USE_EPOLL)
 
-    //@@@
+    // List of signalled events.
+    std::vector<::epoll_event> events(min_events);
+
+    // Main event loop.
+    while (!_exit_requested) {
+
+        // Make provision for all expected events.
+        if (events.size() < _resources.size() || events.size() > _resources.size() / 5) {
+            events.resize(_resources.size() + min_events);
+        }
+
+        // Wait for events. No timeouts, use timers to timeout.
+        const int status = ::epoll_wait(_epoll, &events[0], int(events.size()), -1);
+
+        // In case of error...
+        if (status < 0) {
+            if (errno == EINTR) {
+                // Interrupted by a signal, retry.
+                continue;
+            }
+            else {
+                _report.error(u"error while waiting for epoll: %s", SysErrorCodeMessage());
+                _exit_requested = true;
+                _exit_success = false;
+                break;
+            }
+        }
+
+        // Process all returned events.
+        const size_t evcount = std::min(events.size(), size_t(status));
+        for (size_t i = 0; i < evcount; i++) {
+            const EventId id(events[i].data.fd);
+            const auto ires = _resources.find(id);
+            if (ires == _resources.end()) {
+                _report.debug(u"ignoring unknown or obsolete event %d signaled by epoll", id._id);
+                continue;
+            }
+            // Warning: res can be invalidated if the user-handler updates the reactor. So, keep a copy of it.
+            const auto res(ires->second);
+            if (res.type == EventType::EVENT) {
+                // Try to read from the event file descriptor to verify that the event is actually pending. Loop on EAGAIN.
+                uint64_t data = 0;
+                for (;;) {
+                    if (::read(int(id._id), &data, sizeof(data)) > 0) {
+                        // Successful read => the event was triggered.
+                        // Call the user event callback.
+                        (res.handler->*res.method)(_reactor, id);
+                    }
+                    else if (errno != EAGAIN) {
+                        break;
+                    }
+                }
+            }
+            else if (res.type == EventType::TIMER) {
+                /****@@@@
+                // In case of one-shot event, the timer is removed from the kqueue().
+                // We must manually remove it from the resource map before calling the handler.
+                if (!res.repeat) {
+                    _resources.erase(ires);
+                }
+                // Call the timer callback.
+                (res.handler->*res.method)(_reactor, id);
+                @@@@@@*/
+            }
+            else {
+                _report.debug(u"ignoring %s event %d signaled by epoll", EventTypeNames().name(res.type), id._id);
+            }
+        }
+    }
 
 #elif defined(TS_USE_KQUEUE)
 
-    // List of signalled event.
+    // List of signalled events.
     std::vector<kevent_t> events(min_events);
 
     // Main event loop.
@@ -384,11 +473,19 @@ bool ts::Reactor::Guts::processEventLoop()
 
         // Wait for events. No timeouts, use timers to timeout.
         const int status = ::kevent(_kqueue, nullptr, 0, &events[0], int(events.size()), nullptr);
+
+        // In case of error...
         if (status < 0) {
-            _report.error(u"error while waiting for kevent: %s", SysErrorCodeMessage());
-            _exit_requested = true;
-            _exit_success = false;
-            break;
+            if (errno == EINTR) {
+                // Interrupted by a signal, retry.
+                continue;
+            }
+            else {
+                _report.error(u"error while waiting for kevent: %s", SysErrorCodeMessage());
+                _exit_requested = true;
+                _exit_success = false;
+                break;
+            }
         }
 
         // Process all returned events.
@@ -596,7 +693,25 @@ ts::Reactor::EventId ts::Reactor::Guts::newEventImpl(HandlerInterface* handler, 
 
 #if defined(TS_USE_EPOLL)
 
-    //@@@
+    // Open a event file descriptor.
+    const int evfd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (evfd < 0) {
+        _report.error(u"error creating user event with eventfd(): %s", SysErrorCodeMessage());
+        return id;
+    }
+
+    // Register event in epoll queue.
+    ::epoll_event event;
+    TS_ZERO(event);
+    event.events = EPOLLIN | EPOLLET;
+    if (::epoll_ctl(_epoll, EPOLL_CTL_ADD, evfd, &event) < 0) {
+        _report.error(u"error adding  user event to epoll: %s", SysErrorCodeMessage());
+        ::close(evfd);
+        return id;
+    }
+
+    // The event is now fully registered.
+    id._id = EventId::Id(evfd);
 
 #elif defined(TS_USE_KQUEUE)
 
@@ -642,7 +757,12 @@ bool ts::Reactor::Guts::signalEvent(EventId id)
 
 #if defined(TS_USE_EPOLL)
 
-    //@@@
+    // Write the 64-bit value 1 in the event file descriptor.
+    uint64_t value = 1;
+    if (::write(int(id._id), &value, sizeof(value)) < 0) {
+        _report.error(u"error triggering user event in epoll: %s", SysErrorCodeMessage());
+        success = false;
+    }
 
 #elif defined(TS_USE_KQUEUE)
 
@@ -691,7 +811,12 @@ bool ts::Reactor::Guts::sysDeleteEvent(EventId id, Resource& res, bool display_e
 
 #if defined(TS_USE_EPOLL)
 
-    //@@@
+    // Remove event from epoll queue.
+    if (::epoll_ctl(_epoll, EPOLL_CTL_DEL, int(id._id), nullptr) < 0) {
+        _report.log(display_errors ? Severity::Error : Severity::Debug, u"error removing user event from epoll: %s", SysErrorCodeMessage());
+        success = false;
+    }
+    ::close(int(id._id));
 
 #elif defined(TS_USE_KQUEUE)
 

@@ -62,11 +62,11 @@ namespace {
         HandlerTimer() = delete;
         HandlerTimer(cn::milliseconds precision) : _precision(precision) {}
 
-        ts::Time start;
+        ts::Time start {};
 
-        ts::Reactor::EventId timer1;
-        ts::Reactor::EventId timer2;
-        ts::Reactor::EventId event1;
+        ts::Reactor::EventId timer1 {};
+        ts::Reactor::EventId timer2 {};
+        ts::Reactor::EventId event1 {};
 
         size_t timer1_count = 0;
         size_t timer2_count = 0;
