@@ -114,10 +114,13 @@ private:
     Resource* getResource(EventId id, EventType type, bool display_errors = true);
 
     // Close the system part of a resource.
-    bool sysDeleteTimer(EventId id, Resource& res, bool display_errors = true);
-    bool sysDeleteEvent(EventId id, Resource& res, bool display_errors = true);
+    bool sysDeleteTimer(EventId id, const Resource& res, bool display_errors = true);
+    bool sysDeleteEvent(EventId id, const Resource& res, bool display_errors = true);
 
 #if defined(TS_USE_EPOLL)
+
+    using timespec_sec_t = decltype(::timespec::tv_sec);
+    using timespec_nsec_t = decltype(::timespec::tv_nsec);
 
     int _epoll = -1;  // File descriptor for epoll().
 
@@ -419,38 +422,52 @@ bool ts::Reactor::Guts::processEventLoop()
         // Process all returned events.
         const size_t evcount = std::min(events.size(), size_t(status));
         for (size_t i = 0; i < evcount; i++) {
-            const EventId id(events[i].data.fd);
+
+            const int fd = events[i].data.fd;
+            const EventId id(fd);
             const auto ires = _resources.find(id);
             if (ires == _resources.end()) {
                 _report.debug(u"ignoring unknown or obsolete event %d signaled by epoll", id._id);
                 continue;
             }
+
             // Warning: res can be invalidated if the user-handler updates the reactor. So, keep a copy of it.
+            // If we need to erase the resource, we must use ires before calling the handler.
             const auto res(ires->second);
+
+            // Dispatch according to the type of event.
             if (res.type == EventType::EVENT) {
                 // Try to read from the event file descriptor to verify that the event is actually pending. Loop on EAGAIN.
                 uint64_t data = 0;
-                for (;;) {
-                    if (::read(int(id._id), &data, sizeof(data)) > 0) {
-                        // Successful read => the event was triggered.
-                        // Call the user event callback.
-                        (res.handler->*res.method)(_reactor, id);
-                    }
-                    else if (errno != EAGAIN) {
-                        break;
-                    }
+                if (::read(fd, &data, sizeof(data)) > 0) {
+                    // Successful read => the event was triggered. Call the user event callback.
+                    (res.handler->*res.method)(_reactor, id);
+                }
+                else if (errno != EAGAIN) {
+                    // Actual error, delete the event.
+                    _report.error(u"error reading user event: %s", SysErrorCodeMessage());
+                    sysDeleteEvent(id, res, false);
+                    _resources.erase(ires);
                 }
             }
             else if (res.type == EventType::TIMER) {
-                /****@@@@
-                // In case of one-shot event, the timer is removed from the kqueue().
-                // We must manually remove it from the resource map before calling the handler.
-                if (!res.repeat) {
+                // Try to read the number of expirations.
+                uint64_t data = 0;
+                if (::read(fd, &data, sizeof(data)) > 0) {
+                    // Successful read => the timer expired. Call the user event callback.
+                    (res.handler->*res.method)(_reactor, id);
+                    // If the timer is not repeated, delete it.
+                    if (!res.repeat) {
+                        sysDeleteTimer(id, res, false);
+                        _resources.erase(ires);
+                    }
+                }
+                else if (errno != EAGAIN) {
+                    // Actual error, delete the timer.
+                    _report.error(u"error reading timer: %s", SysErrorCodeMessage());
+                    sysDeleteTimer(id, res, false);
                     _resources.erase(ires);
                 }
-                // Call the timer callback.
-                (res.handler->*res.method)(_reactor, id);
-                @@@@@@*/
             }
             else {
                 _report.debug(u"ignoring %s event %d signaled by epoll", EventTypeNames().name(res.type), id._id);
@@ -598,11 +615,45 @@ ts::Reactor::EventId ts::Reactor::Guts::newTimerImpl(HandlerInterface* handler, 
 
 #if defined(TS_USE_EPOLL)
 
-    //@@@
+    // On Linux, timers are file descriptors which can be monitored.
+    const int tfd = ::timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+    if (tfd < 0) {
+        _report.error(u"error in timerfd_create: %s", SysErrorCodeMessage());
+        return id;
+    }
+
+    // Register time in epoll queue.
+    ::epoll_event event;
+    TS_ZERO(event);
+    event.events = EPOLLIN | EPOLLET;
+    event.data.fd = tfd;
+    if (::epoll_ctl(_epoll, EPOLL_CTL_ADD, tfd, &event) < 0) {
+        _report.error(u"error adding  timer to epoll: %s", SysErrorCodeMessage());
+        ::close(tfd);
+        return id;
+    }
+
+    // Time definition of the timer.
+    ::itimerspec its;
+    TS_ZERO(its);
+    its.it_value.tv_sec = timespec_sec_t(cn::duration_cast<cn::seconds>(duration).count());
+    its.it_value.tv_nsec = timespec_nsec_t(cn::duration_cast<cn::nanoseconds>(duration).count() % cn::nanoseconds::period::den);
+    if (repeat) {
+        // Repeat at same interval as initial timeout.
+        its.it_interval = its.it_value;
+    }
+    if (::timerfd_settime(tfd, 0, &its, nullptr) < 0) {
+        _report.error(u"error in timerfd_settime: %s", SysErrorCodeMessage());
+        ::epoll_ctl(_epoll, EPOLL_CTL_DEL, tfd, nullptr);
+        ::close(tfd);
+        return id;
+    }
+
+    id._id = EventId::Id(tfd);
 
 #elif defined(TS_USE_KQUEUE)
 
-    // With kqueue(), the timers are arbitrary values.
+    // With kqueue(), the timers ids are arbitrary values.
     id._id = EventId::Id(newUserId());
 
     // Register the event in the kqueue.
@@ -650,13 +701,18 @@ bool ts::Reactor::Guts::cancelTimer(EventId id, bool display_errors)
     return success;
 }
 
-bool ts::Reactor::Guts::sysDeleteTimer(EventId id, Resource& res, bool display_errors)
+bool ts::Reactor::Guts::sysDeleteTimer(EventId id, const Resource& res, bool display_errors)
 {
     bool success = true;
 
 #if defined(TS_USE_EPOLL)
 
-    //@@@
+    // Remove timer from epoll queue.
+    if (::epoll_ctl(_epoll, EPOLL_CTL_DEL, int(id._id), nullptr) < 0) {
+        _report.log(display_errors ? Severity::Error : Severity::Debug, u"error removing timer from epoll: %s", SysErrorCodeMessage());
+        success = false;
+    }
+    ::close(int(id._id));
 
 #elif defined(TS_USE_KQUEUE)
 
@@ -704,6 +760,7 @@ ts::Reactor::EventId ts::Reactor::Guts::newEventImpl(HandlerInterface* handler, 
     ::epoll_event event;
     TS_ZERO(event);
     event.events = EPOLLIN | EPOLLET;
+    event.data.fd = evfd;
     if (::epoll_ctl(_epoll, EPOLL_CTL_ADD, evfd, &event) < 0) {
         _report.error(u"error adding  user event to epoll: %s", SysErrorCodeMessage());
         ::close(evfd);
@@ -805,7 +862,7 @@ bool ts::Reactor::Guts::deleteEvent(EventId id)
     return success;
 }
 
-bool ts::Reactor::Guts::sysDeleteEvent(EventId id, Resource& res, bool display_errors)
+bool ts::Reactor::Guts::sysDeleteEvent(EventId id, const Resource& res, bool display_errors)
 {
     bool success = true;
 
