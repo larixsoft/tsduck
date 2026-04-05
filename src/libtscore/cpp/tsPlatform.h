@@ -1320,21 +1320,24 @@ namespace std {
 //! @endcond
 
 //!
-//! Define a static mutex inside a translation unit.
-//! Inside a source file, it is sometimes necessary to define a static mutex which controls
-//! access to resources in the module. When resources in the source file are invoked in the
-//! initializaiton phase, it is not possible to rely on the fact that the mutex object is
-//! already initialized. This macro solves this problem using an encapsulation of the mutex
-//! object inside a private function of the module.
+//! Define a static variable inside a translation unit.
+//! When a static variable in a source file are invoked in the initializaiton phase,
+//! it is not possible to rely on the fact that the object is already initialized.
+//! This macro solves this problem using an encapsulation of the object inside
+//! a private function of the module.
 //! @ingroup thread
-//! @param mutex_class Fully qualified name of the mutex class.
-//! @param function_name Name of the instance function which returns the mutex object.
+//! @param class_name Fully qualified name of the object class.
+//! @param function_name Name of the instance function which returns the object.
 //! @hideinitializer
 //!
-#define TS_STATIC_MUTEX(mutex_class, function_name)                              \
-    namespace {                                                                  \
-        mutex_class& function_name() { static mutex_class mutex; return mutex; } \
-    }                                                                            \
-    /** @cond nodoxygen */                                                       \
-    using TS_UNIQUE_NAME(for_trailing_semicolon) = int                           \
+#define TS_STATIC_VARIABLE(class_name, function_name)  \
+    namespace {                                        \
+        [[maybe_unused]] class_name& function_name()   \
+        {                                              \
+            static class_name data;                    \
+            return data;                               \
+        }                                              \
+    }                                                  \
+    /** @cond nodoxygen */                             \
+    using TS_UNIQUE_NAME(for_trailing_semicolon) = int \
     /** @endcond */

@@ -33,7 +33,7 @@
     #include <sys/event.h>
     #include "tsAfterStandardHeaders.h"
 #elif defined(TS_WINDOWS)
-    // Use I/O completion ports
+    // Use I/O completion ports, a Windows feature.
     #define TS_USE_IOCP 1
 #else
     #error "Reactor is not supported on this operating system"
@@ -367,6 +367,7 @@ namespace ts {
 
         // Asynchronous timer completion routine.
         static void APIENTRY WinTimerCompletion(::LPVOID arg, ::DWORD timer_low, ::DWORD time_high);
+
 #endif
     };
 }

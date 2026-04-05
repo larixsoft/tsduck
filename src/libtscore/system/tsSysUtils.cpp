@@ -565,6 +565,58 @@ bool ts::StdErrIsTerminal()
 
 
 //----------------------------------------------------------------------------
+// Close a file descriptor on fork().
+//----------------------------------------------------------------------------
+
+#if defined(TS_UNIX)
+// Set of file descriptors to close on fork().
+TS_STATIC_VARIABLE(std::mutex, CloseOnForkExecMutex);
+TS_STATIC_VARIABLE(std::set<int>, CloseOnForkExecList);
+
+// A handler which is invoked once after fork() in the child process.
+namespace {
+    void CloseOnForkExecHandler()
+    {
+        // Close all file descriptors. No need to use the mutex here, in the child process.
+        auto& list(CloseOnForkExecList());
+        for (int fd : list) {
+            ::close(fd);
+        }
+    }
+}
+#endif
+
+// Add a file descriptor in the list.
+void ts::AddCloseOnForkExec(int fd, bool cloexec)
+{
+#if defined(TS_UNIX)
+    // Register the fork() handler the first time.
+    static std::once_flag CloseOnForkExecOnceFlag;
+    std::call_once(CloseOnForkExecOnceFlag, ::pthread_atfork, nullptr, nullptr, CloseOnForkExecHandler);
+
+    // Also set CLOEXEC flag on the file descriptor.
+    if (cloexec) {
+        ::fcntl(fd, F_SETFD, ::fcntl(fd, F_GETFD) | FD_CLOEXEC);
+    }
+
+    // Store the file descriptor in the list.
+    std::lock_guard<std::mutex> lock(CloseOnForkExecMutex());
+    CloseOnForkExecList().insert(fd);
+#endif
+}
+
+// Remove a file descriptor from the list.
+void ts::RemoveCloseOnForkExec(int fd)
+{
+#if defined(TS_UNIX)
+    // Remove the file descriptor from the list.
+    std::lock_guard<std::mutex> lock(CloseOnForkExecMutex());
+    CloseOnForkExecList().insert(fd);
+#endif
+}
+
+
+//----------------------------------------------------------------------------
 // Get the name of a class from the @c type_info of an object.
 //----------------------------------------------------------------------------
 
