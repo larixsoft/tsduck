@@ -13,131 +13,8 @@
 //----------------------------------------------------------------------------
 
 #include "tsReactor.h"
-#include "tsNames.h"
 #include "tsSysUtils.h"
 #include "tsFatal.h"
-
-//
-// Depending on the operating system, we use distinct forms of kernel event queues.
-//
-#if defined(TS_LINUX)
-    // Use epoll(), a Linux specific feature.
-    // Future: investigate io_uring.
-    #define TS_USE_EPOLL 1
-#elif defined(TS_MAC) || defined(TS_BSD)
-    // Use kqueue(), as found on macOS and all BSD systems.
-    #define TS_USE_KQUEUE 1
-#elif defined(TS_WINDOWS)
-    // Use I/O completion ports
-    #define TS_USE_IOCP 1
-#else
-    #error "unsupported operating system"
-#endif
-
-#if defined(TS_USE_EPOLL)
-    #include "tsBeforeStandardHeaders.h"
-    #include <sys/epoll.h>
-    #include <sys/eventfd.h>
-    #include <sys/timerfd.h>
-    #include "tsAfterStandardHeaders.h"
-#elif defined(TS_USE_KQUEUE)
-    #include "tsBeforeStandardHeaders.h"
-    #include <sys/types.h>
-    #include <sys/event.h>
-    #include <sys/time.h>
-    #include "tsAfterStandardHeaders.h"
-#endif
-
-
-//----------------------------------------------------------------------------
-// Internal guts.
-//----------------------------------------------------------------------------
-
-class ts::Reactor::Guts
-{
-    TS_NOBUILD_NOCOPY(Guts);
-public:
-    // Constructor & destructor.
-    Guts(Reactor& reactor, Report& report);
-    ~Guts();
-
-    // Delegated methods from Reactor class.
-    Report& report() { return _report; }
-    bool open();
-    bool close();
-    bool isOpen() const { return _is_open; }
-    bool processEventLoop();
-    void exitEventLoop(bool success);
-    EventId newTimerImpl(HandlerInterface* handler, HandlerMethod method, cn::milliseconds duration, bool repeat);
-    bool cancelTimer(EventId id, bool display_errors);
-    EventId newEventImpl(HandlerInterface* handler, HandlerMethod method);
-    bool signalEvent(EventId id);
-    bool deleteEvent(EventId id);
-
-private:
-    // Types of source events.
-    enum class EventType {NONE, TIMER, EVENT};
-    static const Names& EventTypeNames();
-
-    // Description of one resource to wait for.
-    class Resource
-    {
-        TS_DEFAULT_COPY_MOVE(Resource);
-    public:
-        Resource() = default;
-
-        EventType         type = EventType::NONE;
-        HandlerInterface* handler = nullptr;
-        HandlerMethod     method = nullptr;
-        bool              repeat = false;     // for timers
-    };
-
-    // Map of active resources by id.
-    using ResourceMap = std::map<EventId, Resource>;
-
-    // Reactor private members.
-    Reactor&    _reactor;
-    Report&     _report;
-    bool        _is_open = false;
-    bool        _exit_requested = false;  // Exit event loop when possible.
-    bool        _exit_success = true;     // Exit status for event loop.
-    ResourceMap _resources {};            // Resource to wait for.
-
-    // Check that the reactor is open, check parameters.
-    bool checkOpen();
-    bool checkHandler(HandlerInterface* handler, HandlerMethod method);
-
-    // Register a new resource, if valid. Return nullptr if invalid.
-    Resource* registerResource(EventId id, EventType type, HandlerInterface* handler, HandlerMethod method);
-
-    // Check that a resource exists with the given type. Return nullptr on error.
-    Resource* getResource(EventId id, EventType type, bool display_errors = true);
-
-    // Close the system part of a resource.
-    bool sysDeleteTimer(EventId id, const Resource& res, bool display_errors = true);
-    bool sysDeleteEvent(EventId id, const Resource& res, bool display_errors = true);
-
-#if defined(TS_USE_EPOLL)
-
-    using timespec_sec_t = decltype(::timespec::tv_sec);
-    using timespec_nsec_t = decltype(::timespec::tv_nsec);
-
-    int _epoll = -1;  // File descriptor for epoll().
-
-#elif defined(TS_USE_KQUEUE)
-
-    using kevent_t = struct kevent;
-    using kevent_ident_t = decltype(kevent_t::ident);
-    using kevent_data_t = decltype(kevent_t::data);
-
-    int            _kqueue = -1;        // File descriptor for kqueue(). Can be used in another thread (signal event).
-    kevent_ident_t _ident_counter = 0;  // Allocator for timer and event ids.
-
-    // Allocate a new id for a timer or event. Set the msb to avoid conflict with file descriptor values.
-    kevent_ident_t newUserId() { return _ident_counter++ | (kevent_ident_t(1) << (8 * sizeof(kevent_ident_t) - 1)); }
-
-#endif
-};
 
 
 //----------------------------------------------------------------------------
@@ -145,85 +22,16 @@ private:
 //----------------------------------------------------------------------------
 
 ts::Reactor::Reactor(Report& report) :
-    _guts(new Guts(*this, report))
-{
-    CheckNonNull(_guts);
-}
-
-ts::Reactor::~Reactor()
-{
-    if (_guts != nullptr) {
-        delete _guts;
-        _guts = nullptr;
-    }
-}
-
-
-//----------------------------------------------------------------------------
-// Delegations to internal guts.
-//----------------------------------------------------------------------------
-
-ts::Report& ts::Reactor::report()
-{
-    return _guts->report();
-}
-bool ts::Reactor::open()
-{
-    return _guts->open();
-}
-bool ts::Reactor::close()
-{
-    return _guts->close();
-}
-bool ts::Reactor::isOpen() const
-{
-    return _guts->isOpen();
-}
-void ts::Reactor::exitEventLoop(bool success)
-{
-    _guts->exitEventLoop(success);
-}
-bool ts::Reactor::processEventLoop()
-{
-    return _guts->processEventLoop();
-}
-ts::Reactor::EventId ts::Reactor::newTimerImpl(HandlerInterface* handler, HandlerMethod method, cn::milliseconds duration, bool repeat)
-{
-    return _guts->newTimerImpl(handler, method, duration, repeat);
-}
-bool ts::Reactor::cancelTimer(EventId id, bool display_errors)
-{
-    return _guts->cancelTimer(id, display_errors);
-}
-ts::Reactor::EventId ts::Reactor::newEventImpl(HandlerInterface* handler, HandlerMethod method)
-{
-    return _guts->newEventImpl(handler, method);
-}
-bool ts::Reactor::signalEvent(EventId id)
-{
-    return _guts->signalEvent(id);
-}
-bool ts::Reactor::deleteEvent(EventId id)
-{
-    return _guts->deleteEvent(id);
-}
-
-
-//----------------------------------------------------------------------------
-// Reactor::Guts constructors and destructor.
-//----------------------------------------------------------------------------
-
-ts::Reactor::Guts::Guts(Reactor& reactor, Report& report) :
-    _reactor(reactor),
     _report(report)
 {
 }
 
-ts::Reactor::Guts::~Guts()
+ts::Reactor::~Reactor()
 {
     if (_is_open) {
         close();
     }
+    assert(_resources.empty());
 }
 
 
@@ -237,10 +45,109 @@ ts::Reactor::HandlerInterface::~HandlerInterface()
 
 
 //----------------------------------------------------------------------------
+// Reactor::Resource constructors and destructor.
+//----------------------------------------------------------------------------
+
+ts::Reactor::Resource::Resource() :
+    canary(GOOD)
+{
+}
+
+ts::Reactor::Resource::~Resource()
+{
+    // Detect use-after-free in case of incorrect order of usage.
+    canary = BAD;
+}
+
+
+//----------------------------------------------------------------------------
+// Allocate and register a new resource.
+//----------------------------------------------------------------------------
+
+ts::Reactor::Resource* ts::Reactor::newResource(EventType type, HandlerInterface* handler, HandlerMethod method)
+{
+    Resource* res = new Resource;
+    CheckNonNull(res);
+    res->type = type;
+    res->handler = handler;
+    res->method = method;
+#if defined(TS_USE_IOCP)
+    res->reactor = this;
+#endif
+    _resources.insert(res);
+    return res;
+}
+
+
+//----------------------------------------------------------------------------
+// Deregister and deallocate a resource.
+//----------------------------------------------------------------------------
+
+void ts::Reactor::deleteResource(Resource* res)
+{
+    if (res != nullptr) {
+        _resources.erase(res);
+        delete res;
+    }
+}
+
+
+//----------------------------------------------------------------------------
+// Check that a resource pointer is valid.
+// Internal consistency check to detect incorrect understanding of system
+// mechanisms leading to incorrect order of access to a Resource object.
+//----------------------------------------------------------------------------
+
+const ts::UChar* ts::Reactor::ResourceErrorMessage(Resource* res, EventType expected, EventType& actual)
+{
+    actual = EventType::NONE;
+    if (res == nullptr) {
+        return u"null pointer";
+    }
+    else {
+        // Attempt memory access.
+        try {
+            if (res->canary != Resource::GOOD) {
+                return res->canary == Resource::BAD ? u"reuse after free" : u"not a Resource block";
+            }
+            actual = res->type;
+            if (expected != EventType::NONE && res->type != expected) {
+                return u"inconsistent resource type";
+            }
+        }
+        catch (...) {
+            return u"invalid address";
+        }
+    }
+    return nullptr;
+}
+
+bool ts::Reactor::validateResource(Resource* res, EventType type, bool display_errors)
+{
+    EventType evtype = EventType::NONE;
+    const UChar* cause = ResourceErrorMessage(res, type, evtype);
+    if (cause == nullptr && !_resources.contains(res)) {
+        cause = u"Resource no longer in use in Reactor";
+    }
+    if (cause != nullptr) {
+        const int severity = display_errors ? Severity::Error : Severity::Debug;
+        static const UChar* const prefix = u"reactor internal error: invalid Resource pointer";
+        if (type == EventType::NONE) {
+            _report.log(severity, u"%s, %s", prefix, cause);
+        }
+        else {
+            _report.log(severity, u"%s, %s, type: %s, expected: %s", prefix, cause, EventTypeNames().name(type), EventTypeNames().name(res->type));
+        }
+    }
+    return cause == nullptr;
+}
+
+
+//----------------------------------------------------------------------------
 // Types of source events.
 //----------------------------------------------------------------------------
 
-const ts::Names& ts::Reactor::Guts::EventTypeNames()
+const ts::Names& ts::Reactor::EventTypeNames()
 {
     static const Names data {
         {u"none",  EventType::NONE},
@@ -255,7 +162,7 @@ const ts::Names& ts::Reactor::Guts::EventTypeNames()
 // Open and initialize the Reactor.
 //----------------------------------------------------------------------------
 
-bool ts::Reactor::Guts::open()
+bool ts::Reactor::open()
 {
     if (_is_open) {
         _report.error(u"reactor already open");
@@ -284,7 +191,15 @@ bool ts::Reactor::Guts::open()
 
 #elif defined(TS_USE_IOCP)
 
-    //@@@
+    assert(_iocp == INVALID_HANDLE_VALUE);
+    _iocp = ::CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 0);
+
+    // CreateIoCompletionPort() is documented to return NULL on error but let's be conservative.
+    if (_iocp == nullptr || _iocp == INVALID_HANDLE_VALUE) {
+        _report.error(u"error in CreateIoCompletionPort(): %s", SysErrorCodeMessage());
+        _iocp = INVALID_HANDLE_VALUE;
+        success = false;
+    }
 
 #endif
 
@@ -293,20 +208,45 @@ bool ts::Reactor::Guts::open()
 
 
 //----------------------------------------------------------------------------
+// Check that the reactor is open, check parameters.
+//----------------------------------------------------------------------------
+
+bool ts::Reactor::checkOpen()
+{
+    if (!_is_open) {
+        _report.error(u"reactor is not initialized");
+    }
+    return _is_open;
+}
+
+bool ts::Reactor::checkHandler(HandlerInterface* handler, HandlerMethod method)
+{
+    const bool success = handler != nullptr && method != nullptr;
+    if (!success) {
+        _report.error(u"internal error: invalid event handler specified in reactor");
+    }
+    return success;
+}
+
+
+//----------------------------------------------------------------------------
 // Close the Reactor.
 //----------------------------------------------------------------------------
 
-bool ts::Reactor::Guts::close()
+bool ts::Reactor::close()
 {
     bool success = checkOpen();
     if (success) {
         // Force system close of pending resources, if there are any.
-        for (auto it : _resources) {
-            if (it.second.type == EventType::EVENT) {
-                sysDeleteEvent(it.first, it.second, false);
-            }
-            else if (it.second.type == EventType::TIMER) {
-                sysDeleteTimer(it.first, it.second, false);
+        for (auto res : _resources) {
+            if (validateResource(res, EventType::NONE, true)) {
+                if (res->type == EventType::EVENT) {
+                    sysDeleteEvent(res, false);
+                }
+                else if (res->type == EventType::TIMER) {
+                    sysDeleteTimer(res, false);
+                }
+                delete res;
             }
         }
         _resources.clear();
@@ -327,33 +267,15 @@ bool ts::Reactor::Guts::close()
 
 #elif defined(TS_USE_IOCP)
 
-        //@@@
+        // Close the I/O completion port.
+        assert(_iocp != INVALID_HANDLE_VALUE);
+        ::CloseHandle(_iocp);
+        _iocp = INVALID_HANDLE_VALUE;
 
 #endif
     }
+
     _is_open = false;
-    return success;
-}
-
-
-//----------------------------------------------------------------------------
-// Check that the reactor is open, check parameters.
-//----------------------------------------------------------------------------
-
-bool ts::Reactor::Guts::checkOpen()
-{
-    if (!_is_open) {
-        _report.error(u"reactor is not initialized");
-    }
-    return _is_open;
-}
-
-bool ts::Reactor::Guts::checkHandler(HandlerInterface* handler, HandlerMethod method)
-{
-    const bool success = handler != nullptr && method != nullptr;
-    if (!success) {
-        _report.error(u"internal error: invalid event handler specified");
-    }
     return success;
 }
 
@@ -362,7 +284,7 @@ bool ts::Reactor::Guts::checkHandler(HandlerInterface* handler, HandlerMethod me
 // Exit processEventLoop() as soon as possible.
 //----------------------------------------------------------------------------
 
-void ts::Reactor::Guts::exitEventLoop(bool success)
+void ts::Reactor::exitEventLoop(bool success)
 {
     if (checkOpen()) {
         _exit_requested = true;
@@ -377,7 +299,7 @@ void ts::Reactor::Guts::exitEventLoop(bool success)
 // Process events until exit is requested.
 //----------------------------------------------------------------------------
 
-bool ts::Reactor::Guts::processEventLoop()
+bool ts::Reactor::processEventLoop()
 {
     if (!checkOpen()) {
         return false;
@@ -386,23 +308,16 @@ bool ts::Reactor::Guts::processEventLoop()
     _exit_requested = false;
     _exit_success = true;
 
-    // We try to avoid too many reallocations by keeping some minimal number of events.
-    [[maybe_unused]] static constexpr size_t min_events = 16;
-
 #if defined(TS_USE_EPOLL)
 
     // List of signalled events.
-    std::vector<::epoll_event> events(min_events);
+    std::vector<::epoll_event> events(MIN_WAIT_EVENTS);
 
     // Main event loop.
     while (!_exit_requested) {
 
-        // Make provision for all expected events.
-        if (events.size() < _resources.size() || events.size() > _resources.size() / 5) {
-            events.resize(_resources.size() + min_events);
-        }
-
         // Wait for events. No timeouts, use timers to timeout.
+        adjustEventVector(events);
         const int status = ::epoll_wait(_epoll, &events[0], int(events.size()), -1);
 
         // In case of error...
@@ -478,17 +393,13 @@ bool ts::Reactor::Guts::processEventLoop()
 #elif defined(TS_USE_KQUEUE)
 
     // List of signalled events.
-    std::vector<kevent_t> events(min_events);
+    std::vector<kevent_t> events(MIN_WAIT_EVENTS);
 
     // Main event loop.
     while (!_exit_requested) {
 
-        // Make provision for all expected events.
-        if (events.size() < _resources.size() || events.size() > _resources.size() / 5) {
-            events.resize(_resources.size() + min_events);
-        }
-
         // Wait for events. No timeouts, use timers to timeout.
+        adjustEventVector(events);
         const int status = ::kevent(_kqueue, nullptr, 0, &events[0], int(events.size()), nullptr);
 
         // In case of error...
@@ -527,7 +438,7 @@ bool ts::Reactor::Guts::processEventLoop()
                     _resources.erase(ires);
                 }
                 // Call the timer callback.
-                (res.handler->*res.method)(_reactor, id);
+                (res.handler->*res.method)(*this, id);
             }
             else {
                 _report.debug(u"ignoring %s event %d signaled by kevent", EventTypeNames().name(res.type), id._id);
@@ -537,7 +448,64 @@ bool ts::Reactor::Guts::processEventLoop()
 
 #elif defined(TS_USE_IOCP)
 
-    //@@@
+    // List of signalled events.
+    std::vector<::OVERLAPPED_ENTRY> events(MIN_WAIT_EVENTS);
+
+    // Main event loop.
+    while (!_exit_requested) {
+
+        // Wait for events. No timeouts, use timers to timeout.
+        // Important: specify to wait in alertable state (last parameter) to allow timer APC.
+        adjustEventVector(events);
+        ::ULONG retcount = 0;
+        if (!::GetQueuedCompletionStatusEx(_iocp, &events[0], ::ULONG(events.size()), &retcount, INFINITE, true)) {
+            const auto err = ::GetLastError();
+            if (err == STATUS_USER_APC) {
+                // The alertable state was interrupted by a user APC (here probably a timer completion).
+                continue;
+            }
+            else {
+                // Actual error.
+                _report.error(u"error while waiting on I/O completion port: %s", SysErrorCodeMessage(err));
+                _exit_requested = true;
+                _exit_success = false;
+                break;
+            }
+        }
+
+        // Process all returned events.
+        const size_t evcount = std::min(events.size(), size_t(retcount));
+        for (size_t i = 0; i < evcount; i++) {
+
+            // Get and check the associated Resource block.
+            Resource* evres = reinterpret_cast<Resource*>(events[i].lpCompletionKey);
+            if (!validateResource(evres, EventType::NONE, true)) {
+                continue;
+            }
+            const EventId id(evres);
+
+            // Warning: resource can be invalidated if the user-handler updates the reactor. So, keep a copy of it.
+            const auto res(*evres);
+
+            // Process the event, based on a copy of the Resource block.
+            if (res.type == EventType::EVENT) {
+                // Call the user event callback.
+                (res.handler->*res.method)(*this, id);
+            }
+            else if (res.type == EventType::TIMER) {
+                // In case of one-shot event, the timer must be explicitly closed.
+                if (!res.repeat) {
+                    sysDeleteTimer(evres, true);
+                    deleteResource(evres);
+                }
+                // Call the timer callback.
+                (res.handler->*res.method)(*this, id);
+            }
+            else {
+                _report.debug(u"ignoring %s event signaled by kevent", EventTypeNames().name(res.type));
+            }
+        }
+    }
 
 #endif
 
@@ -546,61 +514,10 @@ bool ts::Reactor::Guts::processEventLoop()
 
 
 //----------------------------------------------------------------------------
-// Register a new resource, if valid.
-//----------------------------------------------------------------------------
-
-ts::Reactor::Guts::Resource* ts::Reactor::Guts::registerResource(EventId id, EventType type, HandlerInterface* handler, HandlerMethod method)
-{
-    Resource* res = nullptr;
-    if (id.isValid()) {
-        // This should be a new id.
-        // Currently only emit a warning and return the existing resource.
-        if (_resources.contains(id)) {
-            _report.warning(u"duplicate %s id", EventTypeNames().name(type));
-        }
-
-        // Initialize the resource.
-        res = &_resources[id];
-        res->type = type;
-        res->handler = handler;
-        res->method = method;
-    }
-    return res;
-}
-
-
-//----------------------------------------------------------------------------
-// Check that a resource exists with the given type.
-//----------------------------------------------------------------------------
-
-ts::Reactor::Guts::Resource* ts::Reactor::Guts::getResource(EventId id, EventType type, bool display_errors)
-{
-    Resource* res = nullptr;
-    if (!id.isValid()) {
-        _report.log(display_errors ? Severity::Error : Severity::Debug, u"invalid %s id", EventTypeNames().name(type));
-    }
-    else {
-        auto ires = _resources.find(id);
-        if (ires == _resources.end()) {
-            _report.log(display_errors ? Severity::Error : Severity::Debug, u"%s id no longer exists", EventTypeNames().name(type));
-        }
-        else if (ires->second.type != type) {
-            _report.log(display_errors ? Severity::Error : Severity::Debug, u"inconsistent resource id, expected a %s, got a %s",
-                        EventTypeNames().name(type), EventTypeNames().name(ires->second.type));
-        }
-        else {
-            res = &ires->second;
-        }
-    }
-    return res;
-}
-
-
-//----------------------------------------------------------------------------
 // Add a timer.
 //----------------------------------------------------------------------------
 
-ts::Reactor::EventId ts::Reactor::Guts::newTimerImpl(HandlerInterface* handler, HandlerMethod method, cn::milliseconds duration, bool repeat)
+ts::Reactor::EventId ts::Reactor::newTimerImpl(HandlerInterface* handler, HandlerMethod method, cn::milliseconds duration, bool repeat)
 {
     EventId id;
 
@@ -667,15 +584,37 @@ ts::Reactor::EventId ts::Reactor::Guts::newTimerImpl(HandlerInterface* handler, 
 
 #elif defined(TS_USE_IOCP)
 
-    //@@@
+    // Create the resource block
+    Resource* res = newResource(EventType::TIMER, handler, method);
+    res->repeat = repeat;
+
+    // Create a waitable timer.
+    res->handle = ::CreateWaitableTimerW(nullptr, true, nullptr);
+    if (res->handle == nullptr || res->handle == INVALID_HANDLE_VALUE) {
+        _report.error(u"error creating waitable timer: %s", SysErrorCodeMessage());
+        deleteResource(res);
+        return id;
+    }
+
+    // Build the timer expiration time: Use 100 nanosecond intervals.
+    // - Positive values indicate UTC absolute time in the format described by FILETIME.
+    // - Negative values indicate relative time.
+    ::LARGE_INTEGER expiration;
+    expiration.QuadPart = -(duration.count() * 10'000); // 10,000 100-ns units = 1 ms
+
+    // Set the timer exîration.
+    if (!::SetWaitableTimer(res->handle, &expiration, ::ULONG(repeat ? duration.count() : 0), Reactor::WinTimerCompletion, res, false)) {
+        _report.error(u"error setting waitable timer: %s", SysErrorCodeMessage());
+        ::CloseHandle(res->handle);
+        deleteResource(res);
+        return id;
+    }
+
+    // Time is finally valid.
+    id._res = res;
 
 #endif
 
-    // Register the resource on success (ie. if id is valid).
-    Resource* res = registerResource(id, EventType::TIMER, handler, method);
-    if (res != nullptr) {
-        res->repeat = repeat;
-    }
     return id;
 }
 
@@ -684,24 +623,20 @@ ts::Reactor::EventId ts::Reactor::Guts::newTimerImpl(HandlerInterface* handler, 
 // Cancel a timer.
 //----------------------------------------------------------------------------
 
-bool ts::Reactor::Guts::cancelTimer(EventId id, bool display_errors)
+bool ts::Reactor::cancelTimer(EventId id, bool display_errors)
 {
     // Check parameters.
-    if (!checkOpen()) {
-        return false;
-    }
-    Resource* res = getResource(id, EventType::TIMER, display_errors);
-    if (res == nullptr) {
+    if (!checkOpen() || !validateResource(id._res, EventType::TIMER, display_errors)) {
         return false;
     }
 
     // Cancel and delete the timer.
-    bool success = sysDeleteTimer(id, *res, display_errors);
-    _resources.erase(id);
+    bool success = sysDeleteTimer(id._res, display_errors);
+    deleteResource(id._res);
     return success;
 }
 
-bool ts::Reactor::Guts::sysDeleteTimer(EventId id, const Resource& res, bool display_errors)
+bool ts::Reactor::sysDeleteTimer(Resource* res, bool display_errors)
 {
     bool success = true;
 
@@ -726,7 +661,12 @@ bool ts::Reactor::Guts::sysDeleteTimer(EventId id, const Resource& res, bool dis
 
 #elif defined(TS_USE_IOCP)
 
-    //@@@
+    // Cancel the timer if pending. Ignore errors (timer may not be pending).
+    // Note that CancelWaitableTimer cancels outstanding APCs.
+    // Therefore, WinTimerCompletion won't be called on this one, even is already pending.
+    ::CancelWaitableTimer(res->handle);
+    ::CloseHandle(res->handle);
+    res->handle = INVALID_HANDLE_VALUE;
 
 #endif
 
@@ -735,10 +675,29 @@ bool ts::Reactor::Guts::sysDeleteTimer(EventId id, const Resource& res, bool dis
 
 
 //----------------------------------------------------------------------------
+// Windows-specific: Asynchronous timer completion routine.
+//----------------------------------------------------------------------------
+
+#if defined(TS_USE_IOCP)
+
+void ts::Reactor::WinTimerCompletion(::LPVOID arg, ::DWORD timer_low, ::DWORD time_high)
+{
+    // We are in asynchronous context, don't access the Reactor structures, don't display errors.
+    Resource* res = reinterpret_cast<Resource*>(arg);
+    EventType type = EventType::NONE;
+    if (ResourceErrorMessage(res, EventType::TIMER, type) == nullptr) {
+        // Push a notification using the resource block.
+        ::PostQueuedCompletionStatus(res->reactor->_iocp, 0, ::ULONG_PTR(res), nullptr);
+    }
+}
+
+#endif
+
+//----------------------------------------------------------------------------
 // Add a user event in the reactor.
 //----------------------------------------------------------------------------
 
-ts::Reactor::EventId ts::Reactor::Guts::newEventImpl(HandlerInterface* handler, HandlerMethod method)
+ts::Reactor::EventId ts::Reactor::newEventImpl(HandlerInterface* handler, HandlerMethod method)
 {
     EventId id;
 
@@ -769,6 +728,7 @@ ts::Reactor::EventId ts::Reactor::Guts::newEventImpl(HandlerInterface* handler, 
 
     // The event is now fully registered.
     id._id = EventId::Id(evfd);
+    registerResource(id, EventType::EVENT, handler, method);
 
 #elif defined(TS_USE_KQUEUE)
 
@@ -782,15 +742,16 @@ ts::Reactor::EventId ts::Reactor::Guts::newEventImpl(HandlerInterface* handler, 
         _report.error(u"error registering user event in kqueue: %s", SysErrorCodeMessage());
         id.invalidate();
     }
+    //@@@@ TODO: use a self-defined resource
+    registerResource(id, EventType::EVENT, handler, method);
 
 #elif defined(TS_USE_IOCP)
 
-    //@@@
+    // An event has no specific system handle.
+    id._res = newResource(EventType::TIMER, handler, method);
 
 #endif
 
-    // Register the resource on success (ie. if id is valid).
-    registerResource(id, EventType::EVENT, handler, method);
     return id;
 }
 
@@ -800,7 +761,7 @@ ts::Reactor::EventId ts::Reactor::Guts::newEventImpl(HandlerInterface* handler, 
 // Important: this method can be invoked from any thread.
 //----------------------------------------------------------------------------
 
-bool ts::Reactor::Guts::signalEvent(EventId id)
+bool ts::Reactor::signalEvent(EventId id)
 {
     bool success = true;
 
@@ -833,7 +794,11 @@ bool ts::Reactor::Guts::signalEvent(EventId id)
 
 #elif defined(TS_USE_IOCP)
 
-    //@@@
+    // Push a notification using the resource block.
+    if (!::PostQueuedCompletionStatus(_iocp, 0, ::ULONG_PTR(id._res), nullptr)) {
+        _report.error(u"error triggering user event in PostQueuedCompletionStatus: %s", SysErrorCodeMessage());
+        success = false;
+    }
 
 #endif
 
@@ -845,24 +810,20 @@ bool ts::Reactor::Guts::signalEvent(EventId id)
 // Delete a user event.
 //----------------------------------------------------------------------------
 
-bool ts::Reactor::Guts::deleteEvent(EventId id)
+bool ts::Reactor::deleteEvent(EventId id)
 {
     // Check parameters.
-    if (!checkOpen()) {
-        return false;
-    }
-    Resource* res = getResource(id, EventType::EVENT);
-    if (res == nullptr) {
+    if (!checkOpen() || !validateResource(id._res, EventType::EVENT, true)) {
         return false;
     }
 
     // Delete the event.
-    bool success = sysDeleteEvent(id, *res);
-    _resources.erase(id);
+    bool success = sysDeleteEvent(id._res, true);
+    deleteResource(id._res);
     return success;
 }
 
-bool ts::Reactor::Guts::sysDeleteEvent(EventId id, const Resource& res, bool display_errors)
+bool ts::Reactor::sysDeleteEvent(Resource* res, bool display_errors)
 {
     bool success = true;
 
@@ -887,7 +848,7 @@ bool ts::Reactor::Guts::sysDeleteEvent(EventId id, const Resource& res, bool dis
 
 #elif defined(TS_USE_IOCP)
 
-    //@@@
+    // Nothing to close at system level.
 
 #endif
 

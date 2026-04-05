@@ -13,6 +13,32 @@
 
 #pragma once
 #include "tsReport.h"
+#include "tsNames.h"
+
+// Depending on the operating system, we use distinct forms of kernel event queues.
+//! @cond nodoxygen
+#if defined(TS_LINUX)
+    // Use epoll(), a Linux specific feature.
+    // Future: investigate io_uring.
+    #define TS_USE_EPOLL 1
+    #include "tsBeforeStandardHeaders.h"
+    #include <sys/epoll.h>
+    #include <sys/eventfd.h>
+    #include <sys/timerfd.h>
+    #include "tsAfterStandardHeaders.h"
+#elif defined(TS_MAC) || defined(TS_BSD)
+    // Use kqueue(), as found on macOS and all BSD systems.
+    #define TS_USE_KQUEUE 1
+    #include "tsBeforeStandardHeaders.h"
+    #include <sys/event.h>
+    #include "tsAfterStandardHeaders.h"
+#elif defined(TS_WINDOWS)
+    // Use I/O completion ports
+    #define TS_USE_IOCP 1
+#else
+    #error "Reactor is not supported on this operating system"
+#endif
+//! @endcond
 
 namespace ts {
     //!
@@ -32,6 +58,9 @@ namespace ts {
     class TSCOREDLL Reactor
     {
         TS_NOBUILD_NOCOPY(Reactor);
+    private:
+        class Resource;
+
     public:
         //!
         //! Constructor.
@@ -50,7 +79,7 @@ namespace ts {
         //! Can be called from another thread if the Report object is thread-safe.
         //! @return A reference to the associated report.
         //!
-        Report& report();
+        Report& report() { return _report; }
 
         //!
         //! Open and initialize the Reactor.
@@ -71,7 +100,7 @@ namespace ts {
         //! Check if the Reactor is open.
         //! @return True if the Reactor is open, false otherwise.
         //!
-        bool isOpen() const;
+        bool isOpen() const { return _is_open; }
 
         //!
         //! Process events until exit is requested.
@@ -94,48 +123,50 @@ namespace ts {
         //!
         class TSCOREDLL EventId
         {
+        private:
+            Resource* _res;
+
         public:
             //!
             //! Default constructor.
             //!
-            EventId() = default;
+            EventId() : _res(nullptr) {}
 
             //!
             //! Check if the source id is valid.
             //! @return True if the source id is valid.
             //!
-            bool isValid() const { return _id != _invalid; }
+            bool isValid() const { return _res != nullptr; }
 
             //!
             //! Invalidate the content of this object.
             //!
-            void invalidate() { _id = _invalid; }
+            void invalidate() { _res = nullptr; }
 
             //!
             //! Equality operator.
             //! @param [in] other Other instance to compare.
             //! @return True if this object is equal to @a other.
             //!
-            bool operator==(const EventId& other) const { return _id == other._id; }
+            bool operator==(const EventId& other) const { return _res == other._res; }
 
             //!
             //! Less than operator (for use in hash tables).
             //! @param [in] other Other instance to compare.
             //! @return True if this object is less to @a other.
             //!
-            bool operator<(const EventId& other) const { return _id < other._id; }
+            bool operator<(const EventId& other) const { return _res < other._res; }
+
+            //!
+            //! Get a string representation, for debug purpose.
+            //! @return A string representation of this object (an integer value).
+            //!
+            UString toString() const { return UString::Hexa(reinterpret_cast<uintptr_t>(_res)); }
 
         private:
-            using Id = uint64_t;
-            static constexpr Id _invalid = std::numeric_limits<Id>::max();
-            Id _id = _invalid;
-
             // The internal value is directly managed by the implementation of the reactor.
             friend class Reactor;
-
-            // Private constructor using an arbitrary integer value.
-            template <typename T> requires std::integral<T>
-            EventId(T id) : _id(static_cast<Id>(id)) {}
+            EventId(Resource* res) : _res(res) {}
         };
 
         //!
@@ -226,13 +257,116 @@ namespace ts {
         bool deleteEvent(EventId id);
 
     private:
-        // System-specific parts are stored in a private structure.
-        // This is done to avoid inclusion of specialized headers in this public file.
-        class Guts;
-        Guts* _guts = nullptr;
+        // Types of source events.
+        enum class EventType {NONE, TIMER, EVENT};
+        static const Names& EventTypeNames();
 
-        // Implementation of template methods.
+        // Description of one resource to wait for (I/O, timer, event, etc.)
+        // All implementations (epoll, kqueue, iocp) associate some "user pointer" to an event. This pointer is the address
+        // of a Resource object. We must be sure that the associated Resource object is stable (same address, still valid)
+        // at completion of events. To track potential errors in our interpretation of the various operating system logics,
+        // we use some internal consistency checks.
+        class Resource
+        {
+            TS_DEFAULT_COPY_MOVE(Resource);
+        public:
+            // Values for canary (internal consistency check).
+            static constexpr uint32_t GOOD = 0x474F4F44; // "GOOD"
+            static constexpr uint32_t BAD  = 0x42414453; // "BADS"
+
+            volatile uint32_t canary;
+            EventType         type = EventType::NONE;
+            HandlerInterface* handler = nullptr;
+            HandlerMethod     method = nullptr;
+            bool              repeat = false;                 // Repeatable timer.
+#if defined(TS_USE_EPOLL) || defined(TS_USE_KQUEUE)
+            int               fd = -1;                        // General-purpose file descriptor.
+#elif defined(TS_USE_IOCP)
+            Reactor*          reactor = nullptr;              // Link to parent reactor, when call in APC.
+            ::HANDLE          handle = INVALID_HANDLE_VALUE;  // General-purpose handle.
+#endif
+
+            // Constructors and destructor.
+            Resource();
+            ~Resource();
+        };
+
+        // Map of active resources by id. The Resource blocks are automatically released.
+        using ResourceMap = std::map<EventId, std::unique_ptr<Resource>>;
+
+        // Reactor private members.
+        Report& _report;
+        bool    _is_open = false;
+        bool    _exit_requested = false;    // Exit event loop when possible.
+        bool    _exit_success = true;       // Exit status for event loop.
+        std::set<Resource*> _resources {};  // Existing allocated resources.
+
+        // Implementation of public template methods.
         EventId newTimerImpl(HandlerInterface* handler, HandlerMethod method, cn::milliseconds duration, bool repeat);
         EventId newEventImpl(HandlerInterface* handler, HandlerMethod method);
+
+        // Check that the reactor is open, check parameters.
+        bool checkOpen();
+        bool checkHandler(HandlerInterface* handler, HandlerMethod method);
+
+        // Allocate and register a new resource.
+        Resource* newResource(EventType type, HandlerInterface* handler, HandlerMethod method);
+
+        // Deregister and deallocate a resource.
+        void deleteResource(Resource* res);
+
+        // Check that a resource pointer is valid. Detect incorrect understanding of system mechanisms.
+        // If expected is not NONE, check the event type and return the actual event type.
+        // Return a static error message or nullptr if the resource pointer seems valid.
+        static const UChar* ResourceErrorMessage(Resource* res, EventType expected, EventType& actual);
+
+        // Check that a resource pointer is valid, registered, and display an error message if required.
+        // is true, do not use the Reactor object (when used from another thread or asynchronous system call).
+        bool validateResource(Resource* res, EventType type, bool display_errors);
+
+        // Close the system part of a resource.
+        bool sysDeleteTimer(Resource* res, bool display_errors);
+        bool sysDeleteEvent(Resource* res, bool display_errors);
+
+        // All implementations are based on some form of kernel queue. The core of the event loop is a wait system call
+        // which uses an array of system structures to receive the completed events. The vector of these system structures
+        // must be at least as large as the number of pending events, which is potentially different at each wait call.
+        // We try to avoid too many reallocations by keeping some minimal number of events.
+        static constexpr size_t MIN_WAIT_EVENTS = 16;
+
+        // Adjust the size of the system structures describing events to wait for. See MIN_WAIT_EVENTS.
+        template <class SYSEVENT>
+        void adjustEventVector(std::vector<SYSEVENT>& events)
+        {
+            if (events.size() < _resources.size() || events.size() > _resources.size() + 10 * MIN_WAIT_EVENTS) {
+                // Current vector is too small or significantly too large.
+                events.resize(_resources.size() + MIN_WAIT_EVENTS);
+            }
+        }
+
+#if defined(TS_USE_EPOLL)
+
+        // Aliases for types in timespec structure (not the same types on all platforms).
+        using timespec_sec_t  = decltype(::timespec::tv_sec);
+        using timespec_nsec_t = decltype(::timespec::tv_nsec);
+
+        int _epoll = -1;  // File descriptor for epoll().
+
+#elif defined(TS_USE_KQUEUE)
+
+        // Aliases for types in kevent structure (not the same types on all platforms).
+        using kevent_t       = struct kevent;
+        using kevent_ident_t = decltype(kevent_t::ident);
+        using kevent_data_t  = decltype(kevent_t::data);
+
+        int _kqueue = -1;  // File descriptor for kqueue(). Can be used in another thread (signal event).
+
+#elif defined(TS_USE_IOCP)
+
+        ::HANDLE _iocp = INVALID_HANDLE_VALUE;  // Handle for the I/O completion port.
+
+        // Asynchronous timer completion routine.
+        static void APIENTRY WinTimerCompletion(::LPVOID arg, ::DWORD timer_low, ::DWORD time_high);
+#endif
     };
 }
