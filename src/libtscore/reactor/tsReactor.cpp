@@ -7,9 +7,6 @@
 // The implementation of this module has been inspired by the excellent
 // article at https://habr.com/en/articles/600123/
 //
-// TODO: With epoll and kqueue, make sure that file descriptors are properly
-// closed on fork() or exec().
-//
 //----------------------------------------------------------------------------
 
 #include "tsReactor.h"
@@ -423,23 +420,28 @@ bool ts::Reactor::processEventLoop()
         // Process all returned events.
         const size_t evcount = std::min(events.size(), size_t(status));
         for (size_t i = 0; i < evcount; i++) {
-            const EventId id(events[i].ident);
-            const auto ires = _resources.find(id);
-            if (ires == _resources.end()) {
-                _report.debug(u"ignoring unknown or obsolete event %d signaled by kevent", id._id);
+
+            // Get and check the associated Resource block.
+            Resource* evres = reinterpret_cast<Resource*>(events[i].udata);
+            if (!validateResource(evres, EventType::NONE, true)) {
                 continue;
             }
-            // Warning: res can be invalidated if the user-handler updates the reactor. So, keep a copy of it.
-            const auto res(ires->second);
+            const EventId id(evres);
+
+            // Warning: resource can be invalidated if the user-handler updates the reactor. So, keep a copy of it.
+            // If we need to erase the resource, we must use ires before calling the handler.
+            const auto res(*evres);
+
+            // Process the event, based on a copy of the Resource block.
             if (res.type == EventType::EVENT) {
                 // Call the user event callback.
-                (res.handler->*res.method)(_reactor, id);
+                (res.handler->*res.method)(*this, id);
             }
             else if (res.type == EventType::TIMER) {
                 // In case of one-shot event, the timer is removed from the kqueue().
                 // We must manually remove it from the resource map before calling the handler.
                 if (!res.repeat) {
-                    _resources.erase(ires);
+                    deleteResource(evres);
                 }
                 // Call the timer callback.
                 (res.handler->*res.method)(*this, id);
@@ -582,16 +584,14 @@ ts::Reactor::EventId ts::Reactor::newTimerImpl(HandlerInterface* handler, Handle
 
 #elif defined(TS_USE_KQUEUE)
 
-    // With kqueue(), the timers ids are arbitrary values.
-    id._id = EventId::Id(newUserId());
-
-    // Register the event in the kqueue.
+    // With kqueue(), the timers ids are arbitrary values. Register the event in the kqueue.
     // In kevent, the default value for timer is in milliseconds.
     kevent_t ev;
-    EV_SET(&ev, kevent_ident_t(id._id), EVFILT_TIMER, EV_ADD | EV_ENABLE | (repeat ? 0 : EV_ONESHOT), 0, kevent_data_t(duration.count()), nullptr);
+    EV_SET(&ev, kevent_ident_t(res), EVFILT_TIMER, EV_ADD | EV_ENABLE | (repeat ? 0 : EV_ONESHOT), 0, kevent_data_t(duration.count()), res);
     if (::kevent(_kqueue, &ev, 1, nullptr, 0, nullptr) < 0) {
         _report.error(u"error registering timer in kqueue: %s", SysErrorCodeMessage());
-        id.invalidate();
+        deleteResource(res);
+        return id;
     }
 
 #elif defined(TS_USE_IOCP)
@@ -661,7 +661,7 @@ bool ts::Reactor::sysDeleteTimer(Resource* res, bool display_errors)
 
     // Delete the timer from the kqueue.
     kevent_t ev;
-    EV_SET(&ev, kevent_ident_t(id._id), EVFILT_TIMER, EV_DELETE | EV_DISABLE, 0, 0, nullptr);
+    EV_SET(&ev, kevent_ident_t(res), EVFILT_TIMER, EV_DELETE | EV_DISABLE, 0, 0, res);
     if (::kevent(_kqueue, &ev, 1, nullptr, 0, nullptr) < 0) {
         _report.log(display_errors ? Severity::Error : Severity::Debug, u"error deleting user event in kqueue: %s", SysErrorCodeMessage());
         success = false;
@@ -744,18 +744,15 @@ ts::Reactor::EventId ts::Reactor::newEventImpl(HandlerInterface* handler, Handle
 
 #elif defined(TS_USE_KQUEUE)
 
-    // With kqueue(), the user-defined events are arbitrary values.
-    id._id = EventId::Id(newUserId());
-
-    // Register the event in the kqueue.
+    // With kqueue(), the user-defined events are arbitrary values. Register the event in the kqueue.
+    // Note: user data is nullptr here, it is non-null on trigger only.
     kevent_t ev;
-    EV_SET(&ev, kevent_ident_t(id._id), EVFILT_USER, EV_ADD | EV_ENABLE | EV_CLEAR, 0, 0, nullptr);
+    EV_SET(&ev, kevent_ident_t(res), EVFILT_USER, EV_ADD | EV_ENABLE | EV_CLEAR, 0, 0, nullptr);
     if (::kevent(_kqueue, &ev, 1, nullptr, 0, nullptr) < 0) {
         _report.error(u"error registering user event in kqueue: %s", SysErrorCodeMessage());
-        id.invalidate();
+        deleteResource(res);
+        return id;
     }
-    //@@@@ TODO: use a self-defined resource
-    registerResource(id, EventType::EVENT, handler, method);
 
 #elif defined(TS_USE_IOCP)
 
@@ -799,7 +796,7 @@ bool ts::Reactor::signalEvent(EventId id)
 
     // Simple trigger, only use the kqueue file descriptor, don't do anything else.
     kevent_t ev;
-    EV_SET(&ev, kevent_ident_t(id._id), EVFILT_USER, 0, NOTE_TRIGGER, 0, nullptr);
+    EV_SET(&ev, kevent_ident_t(id._res), EVFILT_USER, 0, NOTE_TRIGGER, 0, id._res);
     if (::kevent(_kqueue, &ev, 1, nullptr, 0, nullptr) < 0) {
         _report.error(u"error triggering user event in kqueue: %s", SysErrorCodeMessage());
         success = false;
@@ -854,7 +851,7 @@ bool ts::Reactor::sysDeleteEvent(Resource* res, bool display_errors)
 
     // Delete the event from the kqueue.
     kevent_t ev;
-    EV_SET(&ev, kevent_ident_t(id._id), EVFILT_USER, EV_DELETE | EV_DISABLE, 0, 0, nullptr);
+    EV_SET(&ev, kevent_ident_t(res), EVFILT_USER, EV_DELETE | EV_DISABLE, 0, 0, nullptr);
     if (::kevent(_kqueue, &ev, 1, nullptr, 0, nullptr) < 0) {
         _report.log(display_errors ? Severity::Error : Severity::Debug, u"error deleting user event in kqueue: %s", SysErrorCodeMessage());
         success = false;
