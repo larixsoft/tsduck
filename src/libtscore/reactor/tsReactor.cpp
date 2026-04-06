@@ -245,7 +245,14 @@ bool ts::Reactor::close()
                 else if (res->type == EventType::TIMER) {
                     sysDeleteTimer(res, false);
                 }
+                // Free the resource block only if it was validated. Cases where an invalid resource block remains
+                // in a reactor are bugs. In that case, we don't try to delete it (a memory leak is still better
+                // than a potential double-free which may lead to memory corruption).
                 delete res;
+            }
+            else {
+                // Invalid resource block, errors already displayed.
+                success = false;
             }
         }
         _resources.clear();
@@ -382,7 +389,7 @@ bool ts::Reactor::processEventLoop()
                     // Actual error, delete the timer.
                     _report.error(u"error reading timer: %s", SysErrorCodeMessage());
                     sysDeleteTimer(evres, false);
-                    _resources.erase(evres);
+                    deleteResource(evres);
                 }
             }
             else {

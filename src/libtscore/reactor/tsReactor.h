@@ -282,7 +282,7 @@ namespace ts {
 #if defined(TS_USE_EPOLL) || defined(TS_USE_KQUEUE)
             int               fd = -1;                        // General-purpose file descriptor.
 #elif defined(TS_USE_IOCP)
-            Reactor*          reactor = nullptr;              // Link to parent reactor, when call in APC.
+            Reactor*          reactor = nullptr;              // Link to parent reactor, when called in APC.
             ::HANDLE          handle = INVALID_HANDLE_VALUE;  // General-purpose handle.
 #endif
 
