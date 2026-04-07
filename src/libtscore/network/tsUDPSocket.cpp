@@ -35,7 +35,7 @@
 
 
 //----------------------------------------------------------------------------
-// Constructor
+// Constructors and destructor.
 //----------------------------------------------------------------------------
 
 ts::UDPSocket::UDPSocket(bool auto_open, IP gen, Report& report)
@@ -44,11 +44,6 @@ ts::UDPSocket::UDPSocket(bool auto_open, IP gen, Report& report)
         UDPSocket::open(gen, report);
     }
 }
-
-
-//----------------------------------------------------------------------------
-// Destructor
-//----------------------------------------------------------------------------
 
 ts::UDPSocket::~UDPSocket()
 {
@@ -596,15 +591,15 @@ bool ts::UDPSocket::dropMembership(Report& report)
 // Send a message to a destination address and port.
 //----------------------------------------------------------------------------
 
-bool ts::UDPSocket::send(const void* data, size_t size, Report& report)
+bool ts::UDPSocket::send(const void* data, size_t size, Report& report, bool* would_block)
 {
-    return send(data, size, _default_destination, report);
+    return send(data, size, _default_destination, report, would_block);
 }
 
-bool ts::UDPSocket::send(const void* data, size_t size, const IPSocketAddress& dest_in, Report& report)
+bool ts::UDPSocket::send(const void* data, size_t size, const IPSocketAddress& dest_in, Report& report, bool* would_block)
 {
     IPSocketAddress dest(dest_in);
-    if (!convert(dest, report)) {
+    if (!checkNonBlocking(would_block, u"UDPSocket::send", report) || !convert(dest, report)) {
         return false;
     }
 
@@ -612,7 +607,15 @@ bool ts::UDPSocket::send(const void* data, size_t size, const IPSocketAddress& d
     const size_t addr_size = dest.get(addr);
 
     if (::sendto(getSocket(), SysSendBufferPointer(data), SysSendSizeType(size), 0, reinterpret_cast<::sockaddr*>(&addr), socklen_t(addr_size)) < 0) {
-        report.error(u"error sending UDP message: %s", SysErrorCodeMessage());
+        const int err = LastSysErrorCode();
+#if defined(TS_UNIX)
+        if (isNonBlocking() && err == EAGAIN) {
+            assert(would_block != nullptr);
+            *would_block = true;
+            return false;
+        }
+#endif
+        report.error(u"error sending UDP message: %s", SysErrorCodeMessage(err));
         return false;
     }
     return true;
@@ -631,8 +634,14 @@ bool ts::UDPSocket::receive(void* data,
                             const AbortInterface* abort,
                             Report& report,
                             cn::microseconds* timestamp,
-                            TimeStampType* timestamp_type)
+                            TimeStampType* timestamp_type,
+                            bool* would_block)
 {
+    // Check that the application uses the right blocking mode.
+    if (!checkNonBlocking(would_block, u"UDPSocket::receive", report)) {
+        return false;
+    }
+
     // Clear timestamp if specified.
     if (timestamp != nullptr) {
         *timestamp = cn::microseconds(-1);
@@ -645,20 +654,22 @@ bool ts::UDPSocket::receive(void* data,
         const int err = receiveOne(data, max_size, ret_size, sender, destination, report, timestamp, timestamp_type);
 
         if (abort != nullptr && abort->aborting()) {
-            // Aborting, no error message.
+            // User-interrupt, end of processing but no error message
             return false;
         }
         else if (err == 0) {
             // Sometimes, we get "successful" empty message coming from nowhere. Ignore them.
             if (ret_size > 0 || sender.hasAddress()) {
+                // Non-empty message or identified sender, keep this one.
                 return true;
             }
         }
-        else if (abort != nullptr && abort->aborting()) {
-            // User-interrupt, end of processing but no error message
+#if defined(TS_UNIX)
+        else if (isNonBlocking() && err == EAGAIN) {
+            assert(would_block != nullptr);
+            *would_block = true;
             return false;
         }
-#if defined(TS_UNIX)
         else if (err == EINTR) {
             // Got a signal, not a user interrupt, will ignore it
             report.debug(u"signal, not user interrupt");

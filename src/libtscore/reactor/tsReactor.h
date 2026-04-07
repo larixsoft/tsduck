@@ -12,6 +12,7 @@
 //----------------------------------------------------------------------------
 
 #pragma once
+#include "tsReactorHandlerInterface.h"
 #include "tsReport.h"
 #include "tsNames.h"
 
@@ -117,80 +118,6 @@ namespace ts {
         //!
         void exitEventLoop(bool success = true);
 
-        //!
-        //! A way to identify sources of events (I/O, timers, etc).
-        //! This is a small object which can be passed by value at zero cost.
-        //!
-        class TSCOREDLL EventId
-        {
-        private:
-            Resource* _res;
-
-        public:
-            //!
-            //! Default constructor.
-            //!
-            EventId() : _res(nullptr) {}
-
-            //!
-            //! Check if the source id is valid.
-            //! @return True if the source id is valid.
-            //!
-            bool isValid() const { return _res != nullptr; }
-
-            //!
-            //! Invalidate the content of this object.
-            //!
-            void invalidate() { _res = nullptr; }
-
-            //!
-            //! Equality operator.
-            //! @param [in] other Other instance to compare.
-            //! @return True if this object is equal to @a other.
-            //!
-            bool operator==(const EventId& other) const { return _res == other._res; }
-
-            //!
-            //! Less than operator (for use in hash tables).
-            //! @param [in] other Other instance to compare.
-            //! @return True if this object is less to @a other.
-            //!
-            bool operator<(const EventId& other) const { return _res < other._res; }
-
-            //!
-            //! Get a string representation, for debug purpose.
-            //! @return A string representation of this object (an integer value).
-            //!
-            UString toString() const { return UString::Hexa(reinterpret_cast<uintptr_t>(_res)); }
-
-        private:
-            // The internal value is directly managed by the implementation of the reactor.
-            friend class Reactor;
-            EventId(Resource* res) : _res(res) {}
-        };
-
-        //!
-        //! Interface class for all Reactor handlers.
-        //!
-        //! All classes which must be used as handlers must inherit from that class.
-        //!
-        //! Unlike other types of handlers, there is no specific virtual methods to call when a specific type of event
-        //! occurs (timer for instance). For each event, a pointer-to-method shall be passed. Rationale: in an
-        //! application-defined handler class, there are possibly several types of timers, events, etc. Having them
-        //! go through the same virtual method is not efficient.
-        //!
-        class TSCOREDLL HandlerInterface
-        {
-            TS_INTERFACE(HandlerInterface);
-        };
-
-        //!
-        //! Profile of a handler method in a HandlerInterface.
-        //! @param [in,out] reactor Reactor into which the handler is invoked.
-        //! @param [in] id Id of the timer which expires.
-        //!
-        using HandlerMethod = void (HandlerInterface::*)(Reactor& reactor, EventId id);
-
         //--------------------------------------------------------------------
         // TIMERS
         //--------------------------------------------------------------------
@@ -202,17 +129,15 @@ namespace ts {
         //! its expiration, after the handler is invoked. If the timer is repeated, it shall
         //! be explicitly canceled if needed.
         //!
-        //! @param [in] handler Address of a HandlerInterface to call when the timer expires. Return an error if set as @c nullptr.
-        //! @param [in] method Which method to invoke in @a handler when the timer expires. Return an error if set as @c nullptr.
+        //! @param [in] handler Address of a handler to call when the timer expires. Return an error if set as @c nullptr.
         //! @param [in] duration Duration of the timer. Must be strictly positive.
         //! @param [in] repeat If true, the timer is repeated at regular intervals, every @a duration, until canceled.
         //! @return The identity of the timer. Invalid in case of error.
         //!
-        template <class HANDLER, class Rep, class Period>
-            requires std::derived_from<HANDLER, HandlerInterface>
-        EventId newTimer(HANDLER* handler, void (HANDLER::*method)(Reactor& reactor, EventId id), cn::duration<Rep, Period> duration, bool repeat = false)
+        template <class Rep, class Period>
+        EventId newTimer(ReactorTimerHandlerInterface* handler, cn::duration<Rep, Period> duration, bool repeat = false)
         {
-            return newTimerImpl(handler, static_cast<HandlerMethod>(method), cn::duration_cast<cn::milliseconds>(duration), repeat);
+            return newTimerImpl(handler, cn::duration_cast<cn::milliseconds>(duration), repeat);
         }
 
         //!
@@ -230,16 +155,10 @@ namespace ts {
 
         //!
         //! Add a user event in the reactor.
-        //! @param [in] handler Address of a HandlerInterface to call when the event is signalled. Return an error if set as @c nullptr.
-        //! @param [in] method Which method to invoke in @a handler when the event is signalled. Return an error if set as @c nullptr.
+        //! @param [in] handler Address of a handler to call when the event is signalled. Return an error if set as @c nullptr.
         //! @return The identity of the user event. Invalid in case of error.
         //!
-        template <class HANDLER>
-            requires std::derived_from<HANDLER, HandlerInterface>
-        EventId newEvent(HANDLER* handler, void (HANDLER::*method)(Reactor& reactor, EventId id))
-        {
-            return newEventImpl(handler, static_cast<HandlerMethod>(method));
-        }
+        EventId newEvent(ReactorEventHandlerInterface* handler);
 
         //!
         //! Signal a user event in the reactor.
@@ -274,16 +193,16 @@ namespace ts {
             static constexpr uint32_t GOOD = 0x474F4F44; // "GOOD"
             static constexpr uint32_t BAD  = 0x42414453; // "BADS"
 
-            volatile uint32_t canary;
-            EventType         type = EventType::NONE;
-            HandlerInterface* handler = nullptr;
-            HandlerMethod     method = nullptr;
-            bool              repeat = false;                 // Repeatable timer.
+            volatile uint32_t        canary;
+            EventType                type = EventType::NONE;
+            ReactorHandlerInterface* handler = nullptr;
+            bool                     repeat = false;  // Repeatable timer.
+
 #if defined(TS_USE_EPOLL) || defined(TS_USE_KQUEUE)
-            int               fd = -1;                        // General-purpose file descriptor.
+            int      fd = -1;                         // General-purpose file descriptor.
 #elif defined(TS_USE_IOCP)
-            Reactor*          reactor = nullptr;              // Link to parent reactor, when called in APC.
-            ::HANDLE          handle = INVALID_HANDLE_VALUE;  // General-purpose handle.
+            Reactor* reactor = nullptr;               // Link to parent reactor, when called in APC.
+            ::HANDLE handle = INVALID_HANDLE_VALUE;   // General-purpose handle.
 #endif
 
             // Constructors and destructor.
@@ -302,15 +221,13 @@ namespace ts {
         std::set<Resource*> _resources {};  // Existing allocated resources.
 
         // Implementation of public template methods.
-        EventId newTimerImpl(HandlerInterface* handler, HandlerMethod method, cn::milliseconds duration, bool repeat);
-        EventId newEventImpl(HandlerInterface* handler, HandlerMethod method);
+        EventId newTimerImpl(ReactorTimerHandlerInterface* handler, cn::milliseconds duration, bool repeat);
 
-        // Check that the reactor is open, check parameters.
+        // Error checking.
         bool checkOpen();
-        bool checkHandler(HandlerInterface* handler, HandlerMethod method);
 
         // Allocate and register a new resource.
-        Resource* newResource(EventType type, HandlerInterface* handler, HandlerMethod method);
+        Resource* newResource(EventType type, ReactorHandlerInterface* handler);
 
         // Deregister and deallocate a resource.
         void deleteResource(Resource* res);

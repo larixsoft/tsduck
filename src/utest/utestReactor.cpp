@@ -53,7 +53,7 @@ void ReactorTest::beforeTestSuite()
 //----------------------------------------------------------------------------
 
 namespace {
-    class HandlerTimer: public ts::Reactor::HandlerInterface
+    class HandlerTimer: public ts::ReactorTimerHandlerInterface, public ts::ReactorEventHandlerInterface
     {
     private:
         std::ostream&    _debug;
@@ -68,55 +68,55 @@ namespace {
 
         ts::Time start {};
 
-        ts::Reactor::EventId timer1 {};
-        ts::Reactor::EventId timer2 {};
-        ts::Reactor::EventId event1 {};
+        ts::EventId timer1 {};
+        ts::EventId timer2 {};
+        ts::EventId event1 {};
 
         size_t timer1_count = 0;
         size_t timer2_count = 0;
         size_t event1_count = 0;
 
-        void htimer1(ts::Reactor& reactor, ts::Reactor::EventId id);
-        void htimer2(ts::Reactor& reactor, ts::Reactor::EventId id);
-        void hevent1(ts::Reactor& reactor, ts::Reactor::EventId id);
+        virtual void handleTimer(ts::Reactor& reactor, ts::EventId id) override;
+        virtual void handleUserEvent(ts::Reactor& reactor, ts::EventId id) override;
     };
 
-    void HandlerTimer::htimer1(ts::Reactor& reactor, ts::Reactor::EventId id)
+    void HandlerTimer::handleTimer(ts::Reactor& reactor, ts::EventId id)
     {
-        _debug << "HandlerTimer::htimer1: id: " << id.toString() << ", timer1 count: " << timer1_count << std::endl;
+        _debug << "HandlerTimer::handleTimer: id: " << id.toString() << ", timer1 count: " << timer1_count << ", timer2 count: " << timer2_count << std::endl;
 
-        // Repeated timer: 200 ms
-        const ts::Time now(ts::Time::CurrentUTC());
-        TSUNIT_ASSERT(id == timer1);
-        timer1_count++;
-        TSUNIT_ASSERT(timer1_count < 3);
-        TSUNIT_ASSUME(timer2_count == 1);
-        if (timer1_count == 1) {
-            TSUNIT_ASSERT(now >= start + cn::milliseconds(200) - _precision);
+        if (id == timer1) {
+            // Repeated timer: 200 ms
+            const ts::Time now(ts::Time::CurrentUTC());
+            TSUNIT_ASSERT(id == timer1);
+            timer1_count++;
+            TSUNIT_ASSERT(timer1_count < 3);
+            TSUNIT_ASSUME(timer2_count == 1);
+            if (timer1_count == 1) {
+                TSUNIT_ASSERT(now >= start + cn::milliseconds(200) - _precision);
+            }
+            else if (timer1_count == 2) {
+                TSUNIT_ASSERT(now >= start + cn::milliseconds(400) - _precision);
+                TSUNIT_ASSERT(reactor.cancelTimer(id, true));
+                TSUNIT_ASSERT(reactor.signalEvent(event1));
+            }
         }
-        else if (timer1_count == 2) {
-            TSUNIT_ASSERT(now >= start + cn::milliseconds(400) - _precision);
-            TSUNIT_ASSERT(reactor.cancelTimer(id, true));
-            TSUNIT_ASSERT(reactor.signalEvent(event1));
+        else if (id == timer2) {
+            // One-shot timer: 100 ms
+            const ts::Time now(ts::Time::CurrentUTC());
+            TSUNIT_ASSERT(id == timer2);
+            timer2_count++;
+            TSUNIT_EQUAL(1, timer2_count);
+            TSUNIT_ASSUME(timer1_count == 0);
+            TSUNIT_ASSERT(now >= start + cn::milliseconds(100) - _precision);
+        }
+        else {
+            TSUNIT_ASSERT(false);
         }
     }
 
-    void HandlerTimer::htimer2(ts::Reactor& reactor, ts::Reactor::EventId id)
+    void HandlerTimer::handleUserEvent(ts::Reactor& reactor, ts::EventId id)
     {
-        _debug << "HandlerTimer::htimer2: id: " << id.toString() << ", timer2 count: " << timer2_count << std::endl;
-
-        // One-shot timer: 100 ms
-        const ts::Time now(ts::Time::CurrentUTC());
-        TSUNIT_ASSERT(id == timer2);
-        timer2_count++;
-        TSUNIT_EQUAL(1, timer2_count);
-        TSUNIT_ASSUME(timer1_count == 0);
-        TSUNIT_ASSERT(now >= start + cn::milliseconds(100) - _precision);
-    }
-
-    void HandlerTimer::hevent1(ts::Reactor& reactor, ts::Reactor::EventId id)
-    {
-        _debug << "HandlerTimer::hevent1: id: " << id.toString() << ", event1 count: " << event1_count << std::endl;
+        _debug << "HandlerTimer::handleUserEvent: id: " << id.toString() << ", event1 count: " << event1_count << std::endl;
 
         const ts::Time now(ts::Time::CurrentUTC());
         TSUNIT_ASSERT(id == event1);
@@ -138,15 +138,15 @@ TSUNIT_DEFINE_TEST(Timer)
     TSUNIT_ASSERT(reactor.open());
     TSUNIT_ASSERT(reactor.isOpen());
 
-    test.timer1 = reactor.newTimer(&test, &HandlerTimer::htimer1, cn::milliseconds(200), true);
+    test.timer1 = reactor.newTimer(&test, cn::milliseconds(200), true);
     TSUNIT_ASSERT(test.timer1.isValid());
     debug() << "ReactorTest::Timer: timer1 id: " << test.timer1.toString() << std::endl;
 
-    test.timer2 = reactor.newTimer(&test, &HandlerTimer::htimer2, cn::milliseconds(100), false);
+    test.timer2 = reactor.newTimer(&test, cn::milliseconds(100), false);
     TSUNIT_ASSERT(test.timer2.isValid());
     debug() << "ReactorTest::Timer: timer2 id: " << test.timer2.toString() << std::endl;
 
-    test.event1 = reactor.newEvent(&test, &HandlerTimer::hevent1);
+    test.event1 = reactor.newEvent(&test);
     TSUNIT_ASSERT(test.event1.isValid());
     debug() << "ReactorTest::Timer: event1 id: " << test.event1.toString() << std::endl;
 

@@ -322,9 +322,15 @@ namespace ts {
         //! Both address and port are mandatory in the socket address, they cannot
         //! be set to IPAddress::AnyAddress4 or IPSocketAddress::AnyPort.
         //! @param [in,out] report Where to report error.
+        //! @param [in,out] would_block Address of a boolean. If non-null, the socket must be in non-blocking mode.
+        //! When null, the socket must be in blocking mode (the default). When the socket is in non-blocking mode
+        //! and the operation would block, this method returns @a false immediately and @a *would_block is set to true.
+        //! This should not be considered as an error. Otherwise, @a *would_block is set to false.
+        //! Important: The parameter @a would_block should not be used by applications. It should be used only by
+        //! "reactive classes", which work in combination with a Reactor.
         //! @return True on success, false on error.
         //!
-        virtual bool send(const void* data, size_t size, const IPSocketAddress& destination, Report& report = CERR);
+        virtual bool send(const void* data, size_t size, const IPSocketAddress& destination, Report& report = CERR, bool* would_block = nullptr);
 
         //!
         //! Send a message to the default destination address and port.
@@ -332,9 +338,15 @@ namespace ts {
         //! @param [in] data Address of the message to send.
         //! @param [in] size Size in bytes of the message to send.
         //! @param [in,out] report Where to report error.
+        //! @param [in,out] would_block Address of a boolean. If non-null, the socket must be in non-blocking mode.
+        //! When null, the socket must be in blocking mode (the default). When the socket is in non-blocking mode
+        //! and the operation would block, this method returns @a false immediately and @a *would_block is set to true.
+        //! This should not be considered as an error. Otherwise, @a *would_block is set to false.
+        //! Important: The parameter @a would_block should not be used by applications. It should be used only by
+        //! "reactive classes", which work in combination with a Reactor.
         //! @return True on success, false on error.
         //!
-        virtual bool send(const void* data, size_t size, Report& report = CERR);
+        virtual bool send(const void* data, size_t size, Report& report = CERR, bool* would_block = nullptr);
 
         //!
         //! Type of timestamp which is returned by receive().
@@ -362,6 +374,12 @@ namespace ts {
         //! Use setReceiveTimestamps() to enable the generation of receive timestamps.
         //! If the returned value is negative, no timestamp is available.
         //! @param [out] timestamp_type When not null, return the type of receive timestamp.
+        //! @param [in,out] would_block Address of a boolean. If non-null, the socket must be in non-blocking mode.
+        //! When null, the socket must be in blocking mode (the default). When the socket is in non-blocking mode
+        //! and the operation would block, this method returns @a false immediately and @a *would_block is set to true.
+        //! This should not be considered as an error. Otherwise, @a *would_block is set to false.
+        //! Important: The parameter @a would_block should not be used by applications. It should be used only by
+        //! "reactive classes", which work in combination with a Reactor.
         //! @return True on success, false on error.
         //!
         virtual bool receive(void* data,
@@ -372,7 +390,8 @@ namespace ts {
                              const AbortInterface* abort = nullptr,
                              Report& report = CERR,
                              cn::microseconds* timestamp = nullptr,
-                             TimeStampType* timestamp_type = nullptr);
+                             TimeStampType* timestamp_type = nullptr,
+                             bool* would_block = nullptr);
 
         // Implementation of Socket interface.
         virtual bool open(IP gen, Report& report = CERR) override;

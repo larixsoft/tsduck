@@ -12,6 +12,7 @@
 //----------------------------------------------------------------------------
 
 #pragma once
+#include "tsNonBlockingDevice.h"
 #include "tsIPSocketAddress.h"
 #include "tsIPUtils.h"
 #include "tsReport.h"
@@ -21,7 +22,7 @@ namespace ts {
     //! Base class for TCP and UDP sockets.
     //! @ingroup libtscore net
     //!
-    class TSCOREDLL Socket
+    class TSCOREDLL Socket : public NonBlockingDevice
     {
         TS_NOCOPY(Socket);
     public:
@@ -33,7 +34,7 @@ namespace ts {
         //!
         //! Destructor.
         //!
-        virtual ~Socket();
+        virtual ~Socket() override;
 
         //!
         //! Open the socket.
@@ -142,6 +143,9 @@ namespace ts {
         //! @return True on success, false on error.
         //!
         bool convert(IPAddress& addr, Report& report) const;
+
+        // Overloaded methods.
+        virtual bool allowSetNonBlocking() const override;
 
     private:
         volatile SysSocketType _sock = SYS_SOCKET_INVALID;

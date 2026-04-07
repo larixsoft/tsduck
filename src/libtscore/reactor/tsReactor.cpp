@@ -33,15 +33,6 @@ ts::Reactor::~Reactor()
 
 
 //----------------------------------------------------------------------------
-// Reactor::HandlerInterface constructors and destructor.
-//----------------------------------------------------------------------------
-
-ts::Reactor::HandlerInterface::~HandlerInterface()
-{
-}
-
-
-//----------------------------------------------------------------------------
 // Reactor::Resource constructors and destructor.
 //----------------------------------------------------------------------------
 
@@ -61,13 +52,12 @@ ts::Reactor::Resource::~Resource()
 // Allocate and register a new resource.
 //----------------------------------------------------------------------------
 
-ts::Reactor::Resource* ts::Reactor::newResource(EventType type, HandlerInterface* handler, HandlerMethod method)
+ts::Reactor::Resource* ts::Reactor::newResource(EventType type, ReactorHandlerInterface* handler)
 {
     Resource* res = new Resource;
     CheckNonNull(res);
     res->type = type;
     res->handler = handler;
-    res->method = method;
 #if defined(TS_USE_IOCP)
     res->reactor = this;
 #endif
@@ -207,7 +197,7 @@ bool ts::Reactor::open()
 
 
 //----------------------------------------------------------------------------
-// Check that the reactor is open, check parameters.
+// Error checking.
 //----------------------------------------------------------------------------
 
 bool ts::Reactor::checkOpen()
@@ -216,15 +206,6 @@ bool ts::Reactor::checkOpen()
         _report.error(u"reactor is not initialized");
     }
     return _is_open;
-}
-
-bool ts::Reactor::checkHandler(HandlerInterface* handler, HandlerMethod method)
-{
-    const bool success = handler != nullptr && method != nullptr;
-    if (!success) {
-        _report.error(u"internal error: invalid event handler specified in reactor");
-    }
-    return success;
 }
 
 
@@ -363,7 +344,10 @@ bool ts::Reactor::processEventLoop()
                 uint64_t data = 0;
                 if (::read(res.fd, &data, sizeof(data)) > 0) {
                     // Successful read => the event was triggered. Call the user event callback.
-                    (res.handler->*res.method)(*this, id);
+                    ReactorEventHandlerInterface* handler = dynamic_cast<ReactorEventHandlerInterface*>(res.handler);
+                    if (handler != nullptr) {
+                        handler->handleUserEvent(*this, id);
+                    }
                 }
                 else if (errno != EAGAIN) {
                     // Actual error, delete the event.
@@ -383,7 +367,10 @@ bool ts::Reactor::processEventLoop()
                         deleteResource(evres);
                     }
                     // Call the timer callback.
-                    (res.handler->*res.method)(*this, id);
+                    ReactorTimerHandlerInterface* handler = dynamic_cast<ReactorTimerHandlerInterface*>(res.handler);
+                    if (handler != nullptr) {
+                        handler->handleTimer(*this, id);
+                    }
                 }
                 else if (errno != EAGAIN) {
                     // Actual error, delete the timer.
@@ -442,7 +429,10 @@ bool ts::Reactor::processEventLoop()
             // Process the event, based on a copy of the Resource block.
             if (res.type == EventType::EVENT) {
                 // Call the user event callback.
-                (res.handler->*res.method)(*this, id);
+                ReactorEventHandlerInterface* handler = dynamic_cast<ReactorEventHandlerInterface*>(res.handler);
+                if (handler != nullptr) {
+                    handler->handleUserEvent(*this, id);
+                }
             }
             else if (res.type == EventType::TIMER) {
                 // In case of one-shot event, the timer is removed from the kqueue().
@@ -451,7 +441,10 @@ bool ts::Reactor::processEventLoop()
                     deleteResource(evres);
                 }
                 // Call the timer callback.
-                (res.handler->*res.method)(*this, id);
+                ReactorTimerHandlerInterface* handler = dynamic_cast<ReactorTimerHandlerInterface*>(res.handler);
+                if (handler != nullptr) {
+                    handler->handleTimer(*this, id);
+                }
             }
             else {
                 _report.debug(u"ignoring %s event signaled by kevent", EventTypeNames().name(res.type));
@@ -503,7 +496,10 @@ bool ts::Reactor::processEventLoop()
             // Process the event, based on a copy of the Resource block.
             if (res.type == EventType::EVENT) {
                 // Call the user event callback.
-                (res.handler->*res.method)(*this, id);
+                ReactorEventHandlerInterface* handler = dynamic_cast<ReactorEventHandlerInterface*>(res.handler);
+                if (handler != nullptr) {
+                    handler->handleUserEvent(*this, id);
+                }
             }
             else if (res.type == EventType::TIMER) {
                 // In case of one-shot event, the timer must be explicitly closed.
@@ -512,7 +508,10 @@ bool ts::Reactor::processEventLoop()
                     deleteResource(evres);
                 }
                 // Call the timer callback.
-                (res.handler->*res.method)(*this, id);
+                ReactorTimerHandlerInterface* handler = dynamic_cast<ReactorTimerHandlerInterface*>(res.handler);
+                if (handler != nullptr) {
+                    handler->handleTimer(*this, id);
+                }
             }
             else {
                 _report.debug(u"ignoring %s event signaled by GetQueuedCompletionStatusEx", EventTypeNames().name(res.type));
@@ -530,12 +529,12 @@ bool ts::Reactor::processEventLoop()
 // Add a timer.
 //----------------------------------------------------------------------------
 
-ts::Reactor::EventId ts::Reactor::newTimerImpl(HandlerInterface* handler, HandlerMethod method, cn::milliseconds duration, bool repeat)
+ts::EventId ts::Reactor::newTimerImpl(ReactorTimerHandlerInterface* handler, cn::milliseconds duration, bool repeat)
 {
     EventId id;
 
     // Check parameters.
-    if (!checkOpen() || !checkHandler(handler, method)) {
+    if (!checkOpen()) {
         return id;
     }
     if (duration <= cn::milliseconds::zero()) {
@@ -544,7 +543,7 @@ ts::Reactor::EventId ts::Reactor::newTimerImpl(HandlerInterface* handler, Handle
     }
 
     // Create the resource block
-    Resource* res = newResource(EventType::TIMER, handler, method);
+    Resource* res = newResource(EventType::TIMER, handler);
     res->repeat = repeat;
 
 #if defined(TS_USE_EPOLL)
@@ -640,13 +639,14 @@ ts::Reactor::EventId ts::Reactor::newTimerImpl(HandlerInterface* handler, Handle
 bool ts::Reactor::cancelTimer(EventId id, bool display_errors)
 {
     // Check parameters.
-    if (!checkOpen() || !validateResource(id._res, EventType::TIMER, display_errors)) {
+    Resource* res = reinterpret_cast<Resource*>(id._res);
+    if (!checkOpen() || !validateResource(res, EventType::TIMER, display_errors)) {
         return false;
     }
 
     // Cancel and delete the timer.
-    bool success = sysDeleteTimer(id._res, display_errors);
-    deleteResource(id._res);
+    bool success = sysDeleteTimer(res, display_errors);
+    deleteResource(res);
     return success;
 }
 
@@ -712,17 +712,17 @@ void ts::Reactor::WinTimerCompletion(::LPVOID arg, ::DWORD timer_low, ::DWORD ti
 // Add a user event in the reactor.
 //----------------------------------------------------------------------------
 
-ts::Reactor::EventId ts::Reactor::newEventImpl(HandlerInterface* handler, HandlerMethod method)
+ts::EventId ts::Reactor::newEvent(ReactorEventHandlerInterface* handler)
 {
     EventId id;
 
     // Check parameters.
-    if (!checkOpen() || !checkHandler(handler, method)) {
+    if (!checkOpen()) {
         return id;
     }
 
     // Create the resource block
-    Resource* res = newResource(EventType::EVENT, handler, method);
+    Resource* res = newResource(EventType::EVENT, handler);
 
 #if defined(TS_USE_EPOLL)
 
@@ -794,7 +794,8 @@ bool ts::Reactor::signalEvent(EventId id)
 
     // Write the 64-bit value 1 in the event file descriptor.
     uint64_t value = 1;
-    if (::write(id._res->fd, &value, sizeof(value)) < 0) {
+    Resource* res = reinterpret_cast<Resource*>(id._res);
+    if (::write(res->fd, &value, sizeof(value)) < 0) {
         _report.error(u"error triggering user event in epoll: %s", SysErrorCodeMessage());
         success = false;
     }
@@ -830,13 +831,14 @@ bool ts::Reactor::signalEvent(EventId id)
 bool ts::Reactor::deleteEvent(EventId id)
 {
     // Check parameters.
-    if (!checkOpen() || !validateResource(id._res, EventType::EVENT, true)) {
+    Resource* res = reinterpret_cast<Resource*>(id._res);
+    if (!checkOpen() || !validateResource(res, EventType::EVENT, true)) {
         return false;
     }
 
     // Delete the event.
-    bool success = sysDeleteEvent(id._res, true);
-    deleteResource(id._res);
+    bool success = sysDeleteEvent(res, true);
+    deleteResource(res);
     return success;
 }
 

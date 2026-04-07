@@ -25,25 +25,60 @@ ts::Socket::~Socket()
 
 
 //----------------------------------------------------------------------------
+// Check that the non-blocking mode can be set.
+//----------------------------------------------------------------------------
+
+bool ts::Socket::allowSetNonBlocking() const
+{
+    // Cannot change the blocking mode after open.
+    return !isOpen();
+}
+
+
+//----------------------------------------------------------------------------
 // Create the socket
 //----------------------------------------------------------------------------
 
 bool ts::Socket::createSocket(IP gen, int type, int protocol, Report& report)
 {
-    if (_sock != SYS_SOCKET_INVALID) {
+    if (isOpen()) {
         report.error(u"socket already open");
         return false;
     }
+
+    // On some UNIX systems, the socket can be set in non-blocking mode from the beginning.
+    // On macOS, the file descriptor must be manually set in non-blocking mode afterwards.
+    int type_flags = 0;
+#if defined(TS_UNIX) && !defined(TS_MAC)
+    if (isNonBlocking()) {
+        type_flags = SOCK_NONBLOCK;
+    }
+#endif
 
     // Create the socket on IPv6, unless explicitly IPv4.
     _gen = gen == IP::v4 ? IP::v4 : IP::v6;
     report.debug(u"create IPv%d socket, type %d, protocol %d", int(_gen), type, protocol);
 
-    _sock = ::socket(gen == IP::v4 ? AF_INET : AF_INET6, type, protocol);
+    _sock = ::socket(gen == IP::v4 ? AF_INET : AF_INET6, type | type_flags, protocol);
     if (_sock == SYS_SOCKET_INVALID) {
         report.error(u"error creating socket: %s", SysErrorCodeMessage());
         return false;
     }
+
+    // Set the file descriptor in non-blocking mode if not set when the socket was created.
+#if defined(TS_MAC)
+    if (isNonBlocking()) {
+        int flags = ::fcntl(_sock, F_GETFL, 0);
+        if (flags == -1) {
+            report.error(u"error getting socket flags: %s", SysErrorCodeMessage());
+            return false;
+        }
+        if (::fcntl(_sock, F_SETFL, flags | O_NONBLOCK) == -1) {
+            report.error(u"error setting socket in non-blocking mode: %s", SysErrorCodeMessage());
+            return false;
+        }
+     }
+#endif
 
     // Set the IPV6_V6ONLY option to zero on IPv6 sockets (can be used in IPv4 or IPv6 communications).
     // Warning: With OpenBSD, IPv6 sockets are always IPv6-only, so the socket option IPV6_V6ONLY is read-only

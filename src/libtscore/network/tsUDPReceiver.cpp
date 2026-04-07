@@ -122,13 +122,14 @@ bool ts::UDPReceiver::receive(void* data,
                               const ts::AbortInterface* abort,
                               ts::Report& report,
                               cn::microseconds* timestamp,
-                              TimeStampType* timestamp_type)
+                              TimeStampType* timestamp_type,
+                              bool* would_block)
 {
     // Loop on packet reception until one matching filtering criteria is found.
     for (;;) {
 
         // Wait for a UDP message from the superclass.
-        if (!UDPSocket::receive(data, max_size, ret_size, sender, destination, abort, report, timestamp, timestamp_type)) {
+        if (!UDPSocket::receive(data, max_size, ret_size, sender, destination, abort, report, timestamp, timestamp_type, would_block)) {
             return false;
         }
 

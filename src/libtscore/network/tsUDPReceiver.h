@@ -66,7 +66,8 @@ namespace ts {
                              const AbortInterface* abort = nullptr,
                              Report& report = CERR,
                              cn::microseconds* timestamp = nullptr,
-                             TimeStampType* timestamp_type = nullptr) override;
+                             TimeStampType* timestamp_type = nullptr,
+                             bool* would_block = nullptr) override;
 
     private:
         UDPReceiverArgs    _args {};          // Reception parameters (typically from the command line).
