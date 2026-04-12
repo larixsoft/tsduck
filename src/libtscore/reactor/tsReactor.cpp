@@ -118,7 +118,7 @@ bool ts::Reactor::validateResource(Resource* res, EventType type, bool display_e
     }
     if (cause != nullptr) {
         const int severity = display_errors ? Severity::Error : Severity::Debug;
-        static const UChar* const prefix = u"reactor internal error: invalid Resource pointer";
+        static const UChar prefix[] = u"reactor internal error: invalid Resource pointer";
         if (type == EventType::NONE) {
             _report.log(severity, u"%s, %s", prefix, cause);
         }
@@ -140,6 +140,8 @@ const ts::Names& ts::Reactor::EventTypeNames()
         {u"none",  EventType::NONE},
         {u"timer", EventType::TIMER},
         {u"event", EventType::EVENT},
+        {u"read",  EventType::READ},
+        {u"write", EventType::WRITE},
     };
     return data;
 }
@@ -166,17 +168,19 @@ bool ts::Reactor::open()
         _report.error(u"error creating epoll queue: %s", SysErrorCodeMessage());
         success = false;
     }
+    // Unlike kqueue, the epoll file descriptor is inherited by a child created with fork().
+    // Register it to be closed in child process after fork().
     AddCloseOnForkExec(_epoll, false);
 
 #elif defined(TS_USE_KQUEUE)
 
     // Initialize the kernel queue.
+    // Unlike epoll, the kqueue file descriptor is not inherited by a child created with fork().
     assert(_kqueue < 0);
     if ((_kqueue = ::kqueue()) < 0) {
         _report.error(u"error creating kqueue(): %s", SysErrorCodeMessage());
         success = false;
     }
-    AddCloseOnForkExec(_kqueue);
 
 #elif defined(TS_USE_IOCP)
 
@@ -220,11 +224,22 @@ bool ts::Reactor::close()
         // Force system close of pending resources, if there are any.
         for (auto res : _resources) {
             if (validateResource(res, EventType::NONE, true)) {
-                if (res->type == EventType::EVENT) {
-                    sysDeleteEvent(res, false);
-                }
-                else if (res->type == EventType::TIMER) {
-                    sysDeleteTimer(res, false);
+                switch (res->type) {
+                    case EventType::EVENT:
+                        sysDeleteEvent(res, false);
+                        break;
+                    case EventType::TIMER:
+                        sysDeleteTimer(res, false);
+                        break;
+                    case EventType::READ:
+                        sysDeleteRead(res, false);
+                        break;
+                    case EventType::WRITE:
+                        sysDeleteWrite(res, false);
+                        break;
+                    case EventType::NONE:
+                    default:
+                        break;
                 }
                 // Free the resource block only if it was validated. Cases where an invalid resource block remains
                 // in a reactor are bugs. In that case, we don't try to delete it (a memory leak is still better
@@ -250,7 +265,6 @@ bool ts::Reactor::close()
 
         // Cleanup kqueue().
         assert(_kqueue >= 0);
-        RemoveCloseOnForkExec(_kqueue);
         ::close(_kqueue);
         _kqueue = -1;
 
@@ -297,22 +311,30 @@ bool ts::Reactor::processEventLoop()
     _exit_requested = false;
     _exit_success = true;
 
-#if defined(TS_USE_EPOLL)
-
-    // List of signalled events.
-    std::vector<::epoll_event> events(MIN_WAIT_EVENTS);
+    // List of signalled events. The type SysEventStructure depends on the operating system.
+    std::vector<SysEventStructure> events(MIN_WAIT_EVENTS);
 
     // Main event loop.
     while (!_exit_requested) {
 
-        // Wait for events. No timeouts, use timers to timeout.
-        adjustEventVector(events);
-        const int status = ::epoll_wait(_epoll, &events[0], int(events.size()), -1);
+        // Adjust the size of the system structures describing events to wait for.
+        if (events.size() < _resources.size() || events.size() > _resources.size() + 10 * MIN_WAIT_EVENTS) {
+            // Current vector is too small or significantly too large.
+            events.resize(_resources.size() + MIN_WAIT_EVENTS);
+        }
 
-        // In case of error...
-        if (status < 0) {
-            if (errno == EINTR) {
-                // Interrupted by a signal, retry.
+        // Number of valid returned events.
+        size_t evcount = 0;
+
+        // Wait for events. No timeouts, use timers to timeout.
+        #if defined(TS_USE_EPOLL)
+
+            const int status = ::epoll_wait(_epoll, &events[0], int(events.size()), -1);
+            if (status >= 0) {
+                evcount = std::min(events.size(), size_t(status));
+            }
+            else if (errno == EINTR) {
+                // Interrupted by a signal, retry event loop.
                 continue;
             }
             else {
@@ -321,86 +343,15 @@ bool ts::Reactor::processEventLoop()
                 _exit_success = false;
                 break;
             }
-        }
 
-        // Process all returned events.
-        const size_t evcount = std::min(events.size(), size_t(status));
-        for (size_t i = 0; i < evcount; i++) {
+        #elif defined(TS_USE_KQUEUE)
 
-            // Get and check the associated Resource block.
-            Resource* evres = reinterpret_cast<Resource*>(events[i].data.ptr);
-            if (!validateResource(evres, EventType::NONE, true)) {
-                continue;
+            const int status = ::kevent(_kqueue, nullptr, 0, &events[0], int(events.size()), nullptr);
+            if (status >= 0) {
+                evcount = std::min(events.size(), size_t(status));
             }
-            const EventId id(evres);
-
-            // Warning: resource can be invalidated if the user-handler updates the reactor. So, keep a copy of it.
-            // If we need to erase the resource, we must use ires before calling the handler.
-            const auto res(*evres);
-
-            // Process the event, based on a copy of the Resource block.
-            if (res.type == EventType::EVENT) {
-                // Try to read from the event file descriptor to verify that the event is actually pending. Loop on EAGAIN.
-                uint64_t data = 0;
-                if (::read(res.fd, &data, sizeof(data)) > 0) {
-                    // Successful read => the event was triggered. Call the user event callback.
-                    ReactorEventHandlerInterface* handler = dynamic_cast<ReactorEventHandlerInterface*>(res.handler);
-                    if (handler != nullptr) {
-                        handler->handleUserEvent(*this, id);
-                    }
-                }
-                else if (errno != EAGAIN) {
-                    // Actual error, delete the event.
-                    _report.error(u"error reading user event: %s", SysErrorCodeMessage());
-                    sysDeleteEvent(evres, false);
-                    deleteResource(evres);
-                }
-            }
-            else if (res.type == EventType::TIMER) {
-                // Try to read the number of expirations.
-                uint64_t data = 0;
-                if (::read(res.fd, &data, sizeof(data)) > 0) {
-                    // Successful read => the timer expired.
-                    // In case of one-shot event, the timer must be explicitly closed.
-                    if (!res.repeat) {
-                        sysDeleteTimer(evres, true);
-                        deleteResource(evres);
-                    }
-                    // Call the timer callback.
-                    ReactorTimerHandlerInterface* handler = dynamic_cast<ReactorTimerHandlerInterface*>(res.handler);
-                    if (handler != nullptr) {
-                        handler->handleTimer(*this, id);
-                    }
-                }
-                else if (errno != EAGAIN) {
-                    // Actual error, delete the timer.
-                    _report.error(u"error reading timer: %s", SysErrorCodeMessage());
-                    sysDeleteTimer(evres, false);
-                    deleteResource(evres);
-                }
-            }
-            else {
-                _report.debug(u"ignoring %s event signaled by epoll", EventTypeNames().name(res.type));
-            }
-        }
-    }
-
-#elif defined(TS_USE_KQUEUE)
-
-    // List of signalled events.
-    std::vector<kevent_t> events(MIN_WAIT_EVENTS);
-
-    // Main event loop.
-    while (!_exit_requested) {
-
-        // Wait for events. No timeouts, use timers to timeout.
-        adjustEventVector(events);
-        const int status = ::kevent(_kqueue, nullptr, 0, &events[0], int(events.size()), nullptr);
-
-        // In case of error...
-        if (status < 0) {
-            if (errno == EINTR) {
-                // Interrupted by a signal, retry.
+            else if (errno == EINTR) {
+                // Interrupted by a signal, retry event loop.
                 continue;
             }
             else {
@@ -409,14 +360,34 @@ bool ts::Reactor::processEventLoop()
                 _exit_success = false;
                 break;
             }
-        }
+
+        #elif defined(TS_USE_IOCP)
+
+            // Important: specify to wait in alertable state (last parameter) to allow timer APC.
+            ::ULONG retcount = 0;
+            if (::GetQueuedCompletionStatusEx(_iocp, &events[0], ::ULONG(events.size()), &retcount, INFINITE, true)) {
+                evcount = std::min(events.size(), size_t(retcount));
+            }
+            else if (::GetLastError() == STATUS_USER_APC) {
+                // The alertable state was interrupted by a user APC (here probably a timer completion), retry event loop.
+                continue;
+            }
+            else {
+                // Actual error.
+                _report.error(u"error while waiting on I/O completion port: %s", SysErrorCodeMessage());
+                _exit_requested = true;
+                _exit_success = false;
+                break;
+            }
+
+        #endif
 
         // Process all returned events.
-        const size_t evcount = std::min(events.size(), size_t(status));
-        for (size_t i = 0; i < evcount; i++) {
+        for (size_t i = 0; i < evcount && !_exit_requested; i++) {
 
             // Get and check the associated Resource block.
-            Resource* evres = reinterpret_cast<Resource*>(events[i].udata);
+            auto& ev(events[i]);
+            Resource* evres = GetResource(ev);
             if (!validateResource(evres, EventType::NONE, true)) {
                 continue;
             }
@@ -427,99 +398,136 @@ bool ts::Reactor::processEventLoop()
             const auto res(*evres);
 
             // Process the event, based on a copy of the Resource block.
-            if (res.type == EventType::EVENT) {
-                // Call the user event callback.
-                ReactorEventHandlerInterface* handler = dynamic_cast<ReactorEventHandlerInterface*>(res.handler);
-                if (handler != nullptr) {
-                    handler->handleUserEvent(*this, id);
+            bool success = true;
+            switch (res.type) {
+
+                case EventType::EVENT: {
+                    #if defined(TS_USE_EPOLL)
+                        // Try to read from the event file descriptor to verify that the event is actually pending. Loop on EAGAIN.
+                        uint64_t data = 0;
+                        success = ::read(res.fd, &data, sizeof(data)) > 0;
+                        if (!success && errno != EAGAIN) {
+                            // Actual error, delete the event.
+                            _report.error(u"error reading user event: %s", SysErrorCodeMessage());
+                            sysDeleteEvent(evres, false);
+                            deleteResource(evres);
+                        }
+                    #endif
+                    if (success) {
+                        // Call the user event callback.
+                        ReactorEventHandlerInterface* handler = dynamic_cast<ReactorEventHandlerInterface*>(res.handler);
+                        if (handler != nullptr) {
+                            handler->handleUserEvent(*this, id);
+                        }
+                    }
+                    break;
                 }
-            }
-            else if (res.type == EventType::TIMER) {
-                // In case of one-shot event, the timer is removed from the kqueue().
-                // We must manually remove it from the resource map before calling the handler.
-                if (!res.repeat) {
-                    deleteResource(evres);
+
+                case EventType::TIMER: {
+                    #if defined(TS_USE_EPOLL)
+                        // Try to read the number of expirations.
+                        uint64_t data = 0;
+                        success = ::read(res.fd, &data, sizeof(data)) > 0;
+                        if (!success && errno != EAGAIN) {
+                            // Actual error, delete the timer.
+                            _report.error(u"error reading timer: %s", SysErrorCodeMessage());
+                            sysDeleteTimer(evres, false);
+                            deleteResource(evres);
+                        }
+                    #endif
+                    if (success) {
+                        if (!res.repeat) {
+                            // In case of one-shot event, the timer must be explicitly closed.
+                            // Except with kqueue() where one-shot timers are automatically disarmed.
+                            #if !defined(TS_USE_KQUEUE)
+                                sysDeleteTimer(evres, true);
+                            #endif
+                            // Manually remove the one-shot timer from the resource map before calling the handler.
+                            deleteResource(evres);
+                        }
+                        // Call the timer callback.
+                        ReactorTimerHandlerInterface* handler = dynamic_cast<ReactorTimerHandlerInterface*>(res.handler);
+                        if (handler != nullptr) {
+                            handler->handleTimer(*this, id);
+                        }
+                    }
+                    break;
                 }
-                // Call the timer callback.
-                ReactorTimerHandlerInterface* handler = dynamic_cast<ReactorTimerHandlerInterface*>(res.handler);
-                if (handler != nullptr) {
-                    handler->handleTimer(*this, id);
+
+                case EventType::READ: {
+                    size_t io_size = NPOS;
+                    int error_code = 0;
+
+                    #if defined(TS_USE_EPOLL)
+                        //@@@
+                    #elif defined(TS_USE_KQUEUE)
+                        // If the event shall not be repeated, disable it, but keep the filter in the kqueue.
+                        if (!res.repeat) {
+                            kevent_t kev;
+                            EV_SET(&kev, kevent_ident_t(res.fd), EVFILT_READ, EV_DISABLE, 0, 0, evres);
+                            if (::kevent(_kqueue, &kev, 1, nullptr, 0, nullptr) < 0) {
+                                _report.error(u"error disabling read event in kqueue: %s", SysErrorCodeMessage());
+                            }
+                        }
+                        // The data field contains either the pending I/O size or error code.
+                        if (ev.flags & EV_ERROR) {
+                            error_code = int(ev.data);
+                        }
+                        else {
+                            io_size = size_t(ev.data);
+                        }
+                    #elif defined(TS_USE_IOCP)
+                        //@@@
+                    #endif
+
+                    // Call the I/O callback.
+                    ReactorReadHandlerInterface* handler = dynamic_cast<ReactorReadHandlerInterface*>(res.handler);
+                    if (handler != nullptr) {
+                        handler->handleReadEvent(*this, id, io_size, error_code);
+                    }
+                    break;
                 }
-            }
-            else {
-                _report.debug(u"ignoring %s event signaled by kevent", EventTypeNames().name(res.type));
+
+                case EventType::WRITE: {
+                    size_t io_size = NPOS;
+                    int error_code = 0;
+
+                    #if defined(TS_USE_EPOLL)
+                        //@@@
+                    #elif defined(TS_USE_KQUEUE)
+                        // If the event shall not be repeated, disable it, but keep the filter in the kqueue.
+                        if (!res.repeat) {
+                            kevent_t kev;
+                            EV_SET(&kev, kevent_ident_t(res.fd), EVFILT_WRITE, EV_DISABLE, 0, 0, evres);
+                            if (::kevent(_kqueue, &kev, 1, nullptr, 0, nullptr) < 0) {
+                                _report.error(u"error disabling write event in kqueue: %s", SysErrorCodeMessage());
+                            }
+                        }
+                        // The data field contains either the remaining output buffer size or error code.
+                        // We cannot really use the output buffer size, so ignore it.
+                        if (ev.flags & EV_ERROR) {
+                            error_code = int(ev.data);
+                        }
+                    #elif defined(TS_USE_IOCP)
+                        //@@@
+                    #endif
+
+                    // Call the I/O callback.
+                    ReactorWriteHandlerInterface* handler = dynamic_cast<ReactorWriteHandlerInterface*>(res.handler);
+                    if (handler != nullptr) {
+                        handler->handleWriteEvent(*this, id, io_size, error_code);
+                    }
+                    break;
+                }
+
+                case EventType::NONE:
+                default: {
+                    _report.debug(u"ignoring %s event signaled", EventTypeNames().name(res.type));
+                    break;
+                }
             }
         }
     }
-
-#elif defined(TS_USE_IOCP)
-
-    // List of signalled events.
-    std::vector<::OVERLAPPED_ENTRY> events(MIN_WAIT_EVENTS);
-
-    // Main event loop.
-    while (!_exit_requested) {
-
-        // Wait for events. No timeouts, use timers to timeout.
-        // Important: specify to wait in alertable state (last parameter) to allow timer APC.
-        adjustEventVector(events);
-        ::ULONG retcount = 0;
-        if (!::GetQueuedCompletionStatusEx(_iocp, &events[0], ::ULONG(events.size()), &retcount, INFINITE, true)) {
-            const auto err = ::GetLastError();
-            if (err == STATUS_USER_APC) {
-                // The alertable state was interrupted by a user APC (here probably a timer completion).
-                continue;
-            }
-            else {
-                // Actual error.
-                _report.error(u"error while waiting on I/O completion port: %s", SysErrorCodeMessage(err));
-                _exit_requested = true;
-                _exit_success = false;
-                break;
-            }
-        }
-
-        // Process all returned events.
-        const size_t evcount = std::min(events.size(), size_t(retcount));
-        for (size_t i = 0; i < evcount; i++) {
-
-            // Get and check the associated Resource block.
-            Resource* evres = reinterpret_cast<Resource*>(events[i].lpCompletionKey);
-            if (!validateResource(evres, EventType::NONE, true)) {
-                continue;
-            }
-            const EventId id(evres);
-
-            // Warning: resource can be invalidated if the user-handler updates the reactor. So, keep a copy of it.
-            const auto res(*evres);
-
-            // Process the event, based on a copy of the Resource block.
-            if (res.type == EventType::EVENT) {
-                // Call the user event callback.
-                ReactorEventHandlerInterface* handler = dynamic_cast<ReactorEventHandlerInterface*>(res.handler);
-                if (handler != nullptr) {
-                    handler->handleUserEvent(*this, id);
-                }
-            }
-            else if (res.type == EventType::TIMER) {
-                // In case of one-shot event, the timer must be explicitly closed.
-                if (!res.repeat) {
-                    sysDeleteTimer(evres, true);
-                    deleteResource(evres);
-                }
-                // Call the timer callback.
-                ReactorTimerHandlerInterface* handler = dynamic_cast<ReactorTimerHandlerInterface*>(res.handler);
-                if (handler != nullptr) {
-                    handler->handleTimer(*this, id);
-                }
-            }
-            else {
-                _report.debug(u"ignoring %s event signaled by GetQueuedCompletionStatusEx", EventTypeNames().name(res.type));
-            }
-        }
-    }
-
-#endif
 
     return _exit_success;
 }
@@ -869,6 +877,264 @@ bool ts::Reactor::sysDeleteEvent(Resource* res, bool display_errors)
 #elif defined(TS_USE_IOCP)
 
     // Nothing to close at system level.
+
+#endif
+
+    return success;
+}
+
+
+//----------------------------------------------------------------------------
+// Add in the reactor a notification of read-ready or read-completion.
+//----------------------------------------------------------------------------
+
+ts::EventId ts::Reactor::newReadNotify(ReactorReadHandlerInterface* handler, SysSocketType sock, bool repeat)
+{
+    EventId id;
+
+    // Check parameters.
+    if (!checkOpen()) {
+        return id;
+    }
+
+    // Create the resource block
+    Resource* res = newResource(EventType::READ, handler);
+    res->repeat = repeat;
+
+#if defined(TS_USE_EPOLL)
+
+    //@@@
+
+#elif defined(TS_USE_KQUEUE)
+
+    // If repeat is false, we must not use EV_ONESHOT. This would delete the filter from the kqueue.
+    // Instead, we will use EV_DISABLE when the event is fired.
+    kevent_t ev;
+    EV_SET(&ev, kevent_ident_t(sock), EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, res);
+    if (::kevent(_kqueue, &ev, 1, nullptr, 0, nullptr) < 0) {
+        _report.error(u"error registering read event in kqueue: %s", SysErrorCodeMessage());
+        deleteResource(res);
+        return id;
+    }
+    res->fd = sock;
+
+#elif defined(TS_USE_IOCP)
+
+    //@@@
+
+#endif
+
+    // Event is finally valid.
+    id._res = res;
+    return id;
+}
+
+
+//----------------------------------------------------------------------------
+// Rearm a previous one-shot read-ready or read-completion.
+//----------------------------------------------------------------------------
+
+bool ts::Reactor::rearmReadNotify(EventId id, bool repeat)
+{
+    // Check parameters.
+    Resource* res = reinterpret_cast<Resource*>(id._res);
+    if (!checkOpen() || !validateResource(res, EventType::READ, true)) {
+        return false;
+    }
+
+    bool success = true;
+
+#if defined(TS_USE_EPOLL)
+
+    //@@@
+
+#elif defined(TS_USE_KQUEUE)
+
+    kevent_t ev;
+    EV_SET(&ev, kevent_ident_t(res->fd), EVFILT_READ, EV_ENABLE, 0, 0, res);
+    if (::kevent(_kqueue, &ev, 1, nullptr, 0, nullptr) < 0) {
+        _report.error(u"error rearming read event in kqueue: %s", SysErrorCodeMessage());
+        return false;
+    }
+    res->repeat = repeat;
+
+#elif defined(TS_USE_IOCP)
+
+    //@@@
+
+#endif
+
+    return success;
+}
+
+
+//----------------------------------------------------------------------------
+// Delete a notification of read-ready or read-completion.
+//----------------------------------------------------------------------------
+
+bool ts::Reactor::deleteReadNotify(EventId id)
+{
+    // Check parameters.
+    Resource* res = reinterpret_cast<Resource*>(id._res);
+    if (!checkOpen() || !validateResource(res, EventType::READ, true)) {
+        return false;
+    }
+
+    // Delete the event.
+    bool success = sysDeleteRead(res, true);
+    deleteResource(res);
+    return success;
+}
+
+bool ts::Reactor::sysDeleteRead(Resource* res, bool display_errors)
+{
+    bool success = true;
+
+#if defined(TS_USE_EPOLL)
+
+    //@@@@
+
+#elif defined(TS_USE_KQUEUE)
+
+    kevent_t ev;
+    EV_SET(&ev, kevent_ident_t(res->fd), EVFILT_READ, EV_DELETE | EV_DISABLE, 0, 0, nullptr);
+    if (::kevent(_kqueue, &ev, 1, nullptr, 0, nullptr) < 0) {
+        _report.log(display_errors ? Severity::Error : Severity::Debug, u"error deleting read event in kqueue: %s", SysErrorCodeMessage());
+        success = false;
+    }
+
+#elif defined(TS_USE_IOCP)
+
+    //@@@@
+
+#endif
+
+    return success;
+}
+
+
+//----------------------------------------------------------------------------
+// Add in the reactor a notification of write-ready or read-completion.
+//----------------------------------------------------------------------------
+
+ts::EventId ts::Reactor::newWriteNotify(ReactorWriteHandlerInterface* handler, SysSocketType sock, bool repeat)
+{
+    EventId id;
+
+    // Check parameters.
+    if (!checkOpen()) {
+        return id;
+    }
+
+    // Create the resource block
+    Resource* res = newResource(EventType::WRITE, handler);
+    res->repeat = repeat;
+
+#if defined(TS_USE_EPOLL)
+
+    //@@@
+
+#elif defined(TS_USE_KQUEUE)
+
+    // If repeat is false, we must not use EV_ONESHOT. This would delete the filter from the kqueue.
+    // Instead, we will use EV_DISABLE when the event is fired.
+    kevent_t ev;
+    EV_SET(&ev, kevent_ident_t(sock), EVFILT_WRITE, EV_ADD | EV_ENABLE, 0, 0, res);
+    if (::kevent(_kqueue, &ev, 1, nullptr, 0, nullptr) < 0) {
+        _report.error(u"error registering write event in kqueue: %s", SysErrorCodeMessage());
+        deleteResource(res);
+        return id;
+    }
+    res->fd = sock;
+
+#elif defined(TS_USE_IOCP)
+
+    //@@@
+
+#endif
+
+    // Event is finally valid.
+    id._res = res;
+    return id;
+}
+
+
+//----------------------------------------------------------------------------
+// Rearm a previous one-shot write-ready or write-completion.
+//----------------------------------------------------------------------------
+
+bool ts::Reactor::rearmWriteNotify(EventId id, bool repeat)
+{
+    // Check parameters.
+    Resource* res = reinterpret_cast<Resource*>(id._res);
+    if (!checkOpen() || !validateResource(res, EventType::WRITE, true)) {
+        return false;
+    }
+
+    bool success = true;
+
+#if defined(TS_USE_EPOLL)
+
+    //@@@
+
+#elif defined(TS_USE_KQUEUE)
+
+    kevent_t ev;
+    EV_SET(&ev, kevent_ident_t(res->fd), EVFILT_WRITE, EV_ENABLE, 0, 0, res);
+    if (::kevent(_kqueue, &ev, 1, nullptr, 0, nullptr) < 0) {
+        _report.error(u"error rearming read event in kqueue: %s", SysErrorCodeMessage());
+        return false;
+    }
+    res->repeat = repeat;
+
+#elif defined(TS_USE_IOCP)
+
+    //@@@
+
+#endif
+
+    return success;
+}
+
+
+//----------------------------------------------------------------------------
+// Delete a notification of write-ready or write-completion.
+//----------------------------------------------------------------------------
+
+bool ts::Reactor::deleteWriteNotify(EventId id)
+{
+    // Check parameters.
+    Resource* res = reinterpret_cast<Resource*>(id._res);
+    if (!checkOpen() || !validateResource(res, EventType::WRITE, true)) {
+        return false;
+    }
+
+    // Delete the event.
+    bool success = sysDeleteWrite(res, true);
+    deleteResource(res);
+    return success;
+}
+
+bool ts::Reactor::sysDeleteWrite(Resource* res, bool display_errors)
+{
+    bool success = true;
+
+#if defined(TS_USE_EPOLL)
+
+    //@@@@
+
+#elif defined(TS_USE_KQUEUE)
+
+    kevent_t ev;
+    EV_SET(&ev, kevent_ident_t(res->fd), EVFILT_WRITE, EV_DELETE | EV_DISABLE, 0, 0, nullptr);
+    if (::kevent(_kqueue, &ev, 1, nullptr, 0, nullptr) < 0) {
+        _report.log(display_errors ? Severity::Error : Severity::Debug, u"error deleting write event in kqueue: %s", SysErrorCodeMessage());
+        success = false;
+    }
+
+#elif defined(TS_USE_IOCP)
+
+    //@@@@
 
 #endif
 

@@ -39,6 +39,20 @@ namespace ts {
         //!
         virtual ~ReactiveUDPSocket() override;
 
+        // Override synchronous UDPSocket methods, just to disable them (return an error).
+        virtual bool send(const void* data, size_t size, const IPSocketAddress& destination, Report& report = CERR, bool* would_block = nullptr) override;
+        virtual bool send(const void* data, size_t size, Report& report = CERR, bool* would_block = nullptr) override;
+        virtual bool receive(void* data,
+                             size_t max_size,
+                             size_t& ret_size,
+                             IPSocketAddress& sender,
+                             IPSocketAddress& destination,
+                             const AbortInterface* abort = nullptr,
+                             Report& report = CERR,
+                             cn::microseconds* timestamp = nullptr,
+                             TimeStampType* timestamp_type = nullptr,
+                             bool* would_block = nullptr) override;
+
     private:
         Reactor& _reactor;
     };

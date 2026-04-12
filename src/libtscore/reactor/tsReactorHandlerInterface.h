@@ -56,4 +56,44 @@ namespace ts {
         //!
         virtual void handleUserEvent(Reactor& reactor, EventId id) = 0;
     };
+
+    //!
+    //! Interface class for read operation Reactor handlers.
+    //! This kind of handler is normally never used in applications.
+    //! It is used only by "reactive I/O classes", at low level.
+    //!
+    class TSCOREDLL ReactorReadHandlerInterface : public ReactorHandlerInterface
+    {
+        TS_SUBINTERFACE(ReactorReadHandlerInterface);
+    public:
+        //!
+        //! Handle a read-completion or read-ready event in a Reactor.
+        //! @param [in,out] reactor Reactor into which the handler is invoked.
+        //! @param [in] id Id of the event which was signaled.
+        //! @param [in] size Returned size of completed read operation.
+        //! Set to NPOS if not application (read-ready instead of read-completion for instance).
+        //! @param [in] error_code System-specific error code, zero on success, -1 in case of unknown error.
+        //!
+        virtual void handleReadEvent(Reactor& reactor, EventId id, size_t size, int error_code) = 0;
+    };
+
+    //!
+    //! Interface class for write operation Reactor handlers.
+    //! This kind of handler is normally never used in applications.
+    //! It is used only by "reactive I/O classes", at low level.
+    //!
+    class TSCOREDLL ReactorWriteHandlerInterface : public ReactorHandlerInterface
+    {
+        TS_SUBINTERFACE(ReactorWriteHandlerInterface);
+    public:
+        //!
+        //! Handle a write-completion or write-ready event in a Reactor.
+        //! @param [in,out] reactor Reactor into which the handler is invoked.
+        //! @param [in] id Id of the event which was signaled.
+        //! @param [in] size Returned size of completed write operation.
+        //! Set to NPOS if not application (write-ready instead of write-completion for instance).
+        //! @param [in] error_code System-specific error code, zero on success, -1 in case of unknown error.
+        //!
+        virtual void handleWriteEvent(Reactor& reactor, EventId id, size_t size, int error_code) = 0;
+    };
 }

@@ -7,6 +7,7 @@
 //----------------------------------------------------------------------------
 
 #include "tsNonBlockingDevice.h"
+#include "tsCerrReport.h"
 
 
 //----------------------------------------------------------------------------
@@ -60,4 +61,20 @@ bool ts::NonBlockingDevice::checkNonBlocking(bool* would_block, const UChar* opn
         *would_block = false;
     }
     return checkNonBlocking(would_block != nullptr, opname, report);
+}
+
+
+//----------------------------------------------------------------------------
+// Set a default Report for the non-blocking object.
+//----------------------------------------------------------------------------
+
+void ts::NonBlockingDevice::setDefaultReport(Report* report, bool only_if_cerr)
+{
+    _default_report = report;
+    _report_only_if_cerr = only_if_cerr;
+}
+
+ts::Report& ts::NonBlockingDevice::rep(Report& report) const
+{
+    return _default_report == nullptr || (_report_only_if_cerr && &report != &CERR) ? report : *_default_report;
 }

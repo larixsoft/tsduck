@@ -12,3 +12,5 @@
 ts::ReactorHandlerInterface::~ReactorHandlerInterface() {}
 ts::ReactorTimerHandlerInterface::~ReactorTimerHandlerInterface() {}
 ts::ReactorEventHandlerInterface::~ReactorEventHandlerInterface() {}
+ts::ReactorReadHandlerInterface::~ReactorReadHandlerInterface() {}
+ts::ReactorWriteHandlerInterface::~ReactorWriteHandlerInterface() {}

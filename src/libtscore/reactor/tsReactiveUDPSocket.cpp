@@ -19,16 +19,36 @@ ts::ReactiveUDPSocket::ReactiveUDPSocket(Reactor& reactor, bool auto_open, IP ge
 #if defined(TS_UNIX)
     setNonBlocking(true);
 #endif
+    setDefaultReport(&reactor.report(), false);
     if (auto_open) {
         UDPSocket::open(gen, _reactor.report());
     }
 }
 
-
-//----------------------------------------------------------------------------
-// Destructor
-//----------------------------------------------------------------------------
-
 ts::ReactiveUDPSocket::~ReactiveUDPSocket()
 {
+}
+
+
+//----------------------------------------------------------------------------
+// Disable overridden synchronous UDPSocket methods.
+//----------------------------------------------------------------------------
+
+bool ts::ReactiveUDPSocket::send(const void* data, size_t size, const IPSocketAddress& destination, Report& report, bool* would_block)
+{
+    report.error(u"cannot call synchronous send() in reactive UDP socket");
+    return false;
+}
+
+bool ts::ReactiveUDPSocket::send(const void* data, size_t size, Report& report, bool* would_block)
+{
+    report.error(u"cannot call synchronous send() in reactive UDP socket");
+    return false;
+}
+
+bool ts::ReactiveUDPSocket::receive(void* data, size_t max_size, size_t& ret_size, IPSocketAddress& sender, IPSocketAddress& destination,
+                                    const AbortInterface* abort, Report& report, cn::microseconds* timestamp, TimeStampType* timestamp_type, bool* would_block)
+{
+    report.error(u"cannot call synchronous receive() in reactive UDP socket");
+    return false;
 }

@@ -15,6 +15,7 @@
 #include "tsReactorHandlerInterface.h"
 #include "tsReport.h"
 #include "tsNames.h"
+#include "tsIPUtils.h"
 
 // Depending on the operating system, we use distinct forms of kernel event queues.
 //! @cond nodoxygen
@@ -135,7 +136,7 @@ namespace ts {
         //! @return The identity of the timer. Invalid in case of error.
         //!
         template <class Rep, class Period>
-        EventId newTimer(ReactorTimerHandlerInterface* handler, cn::duration<Rep, Period> duration, bool repeat = false)
+        EventId newTimer(ReactorTimerHandlerInterface* handler, cn::duration<Rep, Period> duration, bool repeat)
         {
             return newTimerImpl(handler, cn::duration_cast<cn::milliseconds>(duration), repeat);
         }
@@ -175,9 +176,71 @@ namespace ts {
         //!
         bool deleteEvent(EventId id);
 
+        //--------------------------------------------------------------------
+        // I/O EVENTS
+        //--------------------------------------------------------------------
+
+        //!
+        //! Add in the reactor a notification of read-ready or read-completion on a system file descriptor.
+        //! This method is normally never used in applications. It is used only by "reactive I/O classes", at low level.
+        //! @param [in] handler Address of a handler to call when the operation is ready. Return an error if set as @c nullptr.
+        //! @param [in] sock A system-specific file descriptor or handle. This can be a socket or something else.
+        //! @param [in] repeat If true, the notification is repeated each time it is possible to read, until deleted.
+        //! When false, the notification is disarmed after the first one. Use rearmReadNotify() to reenable it.
+        //! @return The identity of the user event. Invalid in case of error.
+        //!
+        EventId newReadNotify(ReactorReadHandlerInterface* handler, SysSocketType sock, bool repeat);
+
+        //!
+        //! Rearm a previous one-shot read-ready or read-completion.
+        //! This method is normally never used in applications. It is used only by "reactive I/O classes", at low level.
+        //! @param [in] id Event to rearm.
+        //! @param [in] repeat If true, the notification is repeated each time it is possible to read, until deleted.
+        //! When false, the notification is disarmed after the first one. Use rearmReadNotify() again to reenable it.
+        //! @return True on success, false on error.
+        //!
+        bool rearmReadNotify(EventId id, bool repeat);
+
+        //!
+        //! Delete a notification of read-ready or read-completion.
+        //! This method is normally never used in applications. It is used only by "reactive I/O classes", at low level.
+        //! @param [in] id Event to delete.
+        //! @return True on success, false on error.
+        //!
+        bool deleteReadNotify(EventId id);
+
+        //!
+        //! Add in the reactor a notification of write-ready or read-completion on a system file descriptor.
+        //! This method is normally never used in applications. It is used only by "reactive I/O classes", at low level.
+        //! @param [in] handler Address of a handler to call when the operation is ready. Return an error if set as @c nullptr.
+        //! @param [in] sock A system-specific file descriptor or handle. This can be a socket or something else.
+        //! @param [in] repeat If true, the notification is repeated each time it is possible to write, until deleted.
+        //! When false, the notification is disarmed after the first one. Use rearmWriteNotify() to reenable it.
+        //! @return The identity of the user event. Invalid in case of error.
+        //!
+        EventId newWriteNotify(ReactorWriteHandlerInterface* handler, SysSocketType sock, bool repeat);
+
+        //!
+        //! Rearm a previous one-shot write-ready or write-completion.
+        //! This method is normally never used in applications. It is used only by "reactive I/O classes", at low level.
+        //! @param [in] id Event to rearm.
+        //! @param [in] repeat If true, the notification is repeated each time it is possible to write, until deleted.
+        //! When false, the notification is disarmed after the first one. Use rearmWriteNotify() again to reenable it.
+        //! @return True on success, false on error.
+        //!
+        bool rearmWriteNotify(EventId id, bool repeat);
+
+        //!
+        //! Delete a notification of write-ready or write-completion.
+        //! This method is normally never used in applications. It is used only by "reactive I/O classes", at low level.
+        //! @param [in] id Event to delete.
+        //! @return True on success, false on error.
+        //!
+        bool deleteWriteNotify(EventId id);
+
     private:
         // Types of source events.
-        enum class EventType {NONE, TIMER, EVENT};
+        enum class EventType {NONE, TIMER, EVENT, READ, WRITE};
         static const Names& EventTypeNames();
 
         // Description of one resource to wait for (I/O, timer, event, etc.)
@@ -196,7 +259,7 @@ namespace ts {
             volatile uint32_t        canary;
             EventType                type = EventType::NONE;
             ReactorHandlerInterface* handler = nullptr;
-            bool                     repeat = false;  // Repeatable timer.
+            bool                     repeat = false;  // Repeatable timer or notification.
 
 #if defined(TS_USE_EPOLL) || defined(TS_USE_KQUEUE)
             int      fd = -1;                         // General-purpose file descriptor.
@@ -209,9 +272,6 @@ namespace ts {
             Resource();
             ~Resource();
         };
-
-        // Map of active resources by id. The Resource blocks are automatically released.
-        using ResourceMap = std::map<EventId, std::unique_ptr<Resource>>;
 
         // Reactor private members.
         Report& _report;
@@ -233,33 +293,25 @@ namespace ts {
         void deleteResource(Resource* res);
 
         // Check that a resource pointer is valid. Detect incorrect understanding of system mechanisms.
-        // If expected is not NONE, check the event type and return the actual event type.
+        // If @a expected is not NONE, check the event type and return the actual event type.
         // Return a static error message or nullptr if the resource pointer seems valid.
         static const UChar* ResourceErrorMessage(Resource* res, EventType expected, EventType& actual);
 
         // Check that a resource pointer is valid, registered, and display an error message if required.
-        // is true, do not use the Reactor object (when used from another thread or asynchronous system call).
         bool validateResource(Resource* res, EventType type, bool display_errors);
 
         // Close the system part of a resource.
         bool sysDeleteTimer(Resource* res, bool display_errors);
         bool sysDeleteEvent(Resource* res, bool display_errors);
+        bool sysDeleteRead(Resource* res, bool display_errors);
+        bool sysDeleteWrite(Resource* res, bool display_errors);
 
-        // All implementations are based on some form of kernel queue. The core of the event loop is a wait system call
-        // which uses an array of system structures to receive the completed events. The vector of these system structures
-        // must be at least as large as the number of pending events, which is potentially different at each wait call.
+        // All implementations are based on some form of kernel queue. The core of the event loop is a wait system
+        // call which uses an array of system structures, SysEventStructure, to receive the completed events.
+        // The address of the Resource block is stored in that structure. The vector of SysEventStructure must be
+        // at least as large as the number of pending events, which is potentially different at each wait call.
         // We try to avoid too many reallocations by keeping some minimal number of events.
         static constexpr size_t MIN_WAIT_EVENTS = 16;
-
-        // Adjust the size of the system structures describing events to wait for. See MIN_WAIT_EVENTS.
-        template <class SYSEVENT>
-        void adjustEventVector(std::vector<SYSEVENT>& events)
-        {
-            if (events.size() < _resources.size() || events.size() > _resources.size() + 10 * MIN_WAIT_EVENTS) {
-                // Current vector is too small or significantly too large.
-                events.resize(_resources.size() + MIN_WAIT_EVENTS);
-            }
-        }
 
 #if defined(TS_USE_EPOLL)
 
@@ -267,19 +319,41 @@ namespace ts {
         using timespec_sec_t  = decltype(::timespec::tv_sec);
         using timespec_nsec_t = decltype(::timespec::tv_nsec);
 
+        // Returned event structure.
+        using SysEventStructure = ::epoll_event;
+
+        // Extracting the Resource block from a SysEventStructure.
+        static Resource* GetResource(const SysEventStructure& s) { return reinterpret_cast<Resource*>(s.data.ptr); }
+
+        // System-specific Reactor fields.
         int _epoll = -1;  // File descriptor for epoll().
 
 #elif defined(TS_USE_KQUEUE)
 
         // Aliases for types in kevent structure (not the same types on all platforms).
-        using kevent_t       = struct kevent;
+        // Don't use "::kevent" as type name because ::kevent() is also a system call.
+        using kevent_t = struct kevent;
         using kevent_ident_t = decltype(kevent_t::ident);
         using kevent_data_t  = decltype(kevent_t::data);
 
+        // Returned event structure.
+        using SysEventStructure = kevent_t;
+
+        // Extracting the Resource block from a SysEventStructure.
+        static Resource* GetResource(const SysEventStructure& s) { return reinterpret_cast<Resource*>(s.udata); }
+
+        // System-specific Reactor fields.
         int _kqueue = -1;  // File descriptor for kqueue(). Can be used in another thread (signal event).
 
 #elif defined(TS_USE_IOCP)
 
+        // Returned event structure.
+        using SysEventStructure = ::OVERLAPPED_ENTRY;
+
+        // Extracting the Resource block from a SysEventStructure.
+        static Resource* GetResource(const SysEventStructure& s) { return reinterpret_cast<Resource*>(s.lpCompletionKey); }
+
+        // System-specific Reactor fields.
         ::HANDLE _iocp = INVALID_HANDLE_VALUE;  // Handle for the I/O completion port.
 
         // Asynchronous timer completion routine.
